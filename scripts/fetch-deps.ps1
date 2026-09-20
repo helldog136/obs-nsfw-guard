@@ -4,10 +4,13 @@
 # Prérequis : git, Visual Studio (ou Build Tools) avec la charge de travail C++,
 # et OBS Studio installé (on en tire obs.lib depuis obs.dll).
 param(
-	[string]$ObsInstall = "C:\Program Files\obs-studio"
+	[string]$ObsInstall = "C:\Program Files\obs-studio",
+	# Télécharge obs.dll depuis la release OBS au lieu d'utiliser une installation locale (CI).
+	[switch]$DownloadObs
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'  # accélère fortement Invoke-WebRequest sous PowerShell 5.1
 $root = Split-Path $PSScriptRoot -Parent
 $deps = Join-Path $root 'deps'
 $models = Join-Path $root 'models'
@@ -18,6 +21,28 @@ $OrtVersion = '1.24.4'  # Microsoft.ML.OnnxRuntime.DirectML
 $ModelRepo = 'taufiqdp/mobilenetv4_conv_small.e2400_r224_in1k_nsfw_classifier'
 
 New-Item -ItemType Directory -Force $deps, $models | Out-Null
+
+if ($DownloadObs) {
+	$obsRuntime = Join-Path $deps 'obs-runtime'
+	$obsDllPath = Join-Path $obsRuntime 'bin\64bit\obs.dll'
+	if (-not (Test-Path $obsDllPath)) {
+		$zip = Join-Path $deps 'obs-windows.zip'
+		Write-Host "Téléchargement d'OBS $ObsVersion (pour obs.dll uniquement)"
+		Invoke-WebRequest "https://github.com/obsproject/obs-studio/releases/download/$ObsVersion/OBS-Studio-$ObsVersion-Windows-x64.zip" -OutFile $zip
+		Add-Type -AssemblyName System.IO.Compression.FileSystem
+		$archive = [IO.Compression.ZipFile]::OpenRead($zip)
+		try {
+			$entry = $archive.Entries | Where-Object { $_.FullName -eq 'bin/64bit/obs.dll' }
+			if (-not $entry) { throw "bin/64bit/obs.dll absent de l'archive OBS" }
+			New-Item -ItemType Directory -Force (Split-Path $obsDllPath) | Out-Null
+			[IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $obsDllPath, $true)
+		} finally {
+			$archive.Dispose()
+		}
+		Remove-Item $zip
+	}
+	$ObsInstall = $obsRuntime
+}
 
 function Get-NuGetPackage($id, $version, $dest) {
 	if (Test-Path $dest) { return }
