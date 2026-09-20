@@ -20,14 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: VÃ©rifier que le tag correspond Ã  la version du projet
+      - name: Vérifier que le tag correspond à la version du projet
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           $tag = '${{ github.ref_name }}'.TrimStart('v')
           $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(obs-nsfw-guard VERSION ([\d.]+)').Matches[0].Groups[1].Value
-          if ($tag -ne $version) { throw "Le tag v$tag ne correspond pas Ã  la version du CMakeLists.txt ($version)" }
+          if ($tag -ne $version) { throw "Le tag v$tag ne correspond pas à la version du CMakeLists.txt ($version)" }
 
-      - name: Cache des dÃ©pendances
+      - name: Cache des dépendances
         uses: actions/cache@v6
         with:
           path: |
@@ -35,16 +35,16 @@ jobs:
             models
           key: deps-${{ hashFiles('scripts/fetch-deps.ps1') }}
 
-      - name: RÃ©cupÃ©rer les dÃ©pendances
+      - name: Récupérer les dépendances
         run: ./scripts/fetch-deps.ps1 -DownloadObs
 
       - name: Compiler
         run: ./scripts/build.ps1
 
-      - name: CrÃ©er l'archive
+      - name: Créer l'archive
         run: ./scripts/package.ps1
 
-      - name: Somme de contrÃ´le
+      - name: Somme de contrôle
         run: |
           Get-ChildItem dist/*.zip | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
@@ -70,7 +70,7 @@ jobs:
           name: obs-nsfw-guard-windows-x64
           path: dist
 
-      - name: CrÃ©er la release GitHub
+      - name: Créer la release GitHub
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
