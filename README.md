@@ -8,7 +8,7 @@ d'écran, capture de fenêtre, navigateur, etc.
 
 ## Fonctionnement
 
-- Chaque image de la source est réduite à 224×224 et analysée par un petit classifieur
+- Chaque image de la source est réduite à 224×224 (méthode par défaut, voir « Méthodes d'analyse ») et analysée par un petit classifieur
   ([MobileNetV4](https://huggingface.co/taufiqdp/mobilenetv4_conv_small.e2400_r224_in1k_nsfw_classifier), 9,5 Mo)
   exécuté par ONNX Runtime dans un thread dédié : le rendu d'OBS n'est jamais bloqué.
 - **Délai de rendu intégré** : quelques images sont mises en tampon pour que le masque arrive *avant* l'image
@@ -42,17 +42,37 @@ L'installeur n'est pas signé : Windows SmartScreen peut afficher un avertisseme
 | Maintenir le masque | Durée du masque après la dernière détection. |
 | Style du masque | Noir, pixelisé (taille de bloc réglable) ou flou gaussien (intensité réglable). |
 | Retarder l'image | Tampon qui laisse le temps à l'analyse. Automatique ou en nombre d'images. |
+| Méthode d'analyse | Ce qui est envoyé au modèle : image entière réduite, zone aléatoire, mixte ou grille de zones. Voir ci-dessous. |
+| Taille de la zone aléatoire | Côté (en pixels de la source) de la zone analysée en mode « zone aléatoire » ou « mixte ». |
 | Analyser une image sur | Fréquence d'analyse (1 = chaque image). |
 | GPU (DirectML) | Utilise le GPU au lieu du CPU. Le CPU suffit et ne concurrence pas le jeu. |
 | Masquer tant que le modèle n'est pas prêt | La source reste masquée pendant le chargement du modèle. |
 | Journaliser scores et temps | Écrit score, temps d'inférence, latence et délai dans le journal d'OBS pour calibrer le seuil. |
 
+## Méthodes d'analyse
+
+Le modèle ne voit que des images de 224×224 pixels. Réduire un écran entier à cette taille peut effacer
+les petits éléments (miniature, pop-up, coin de page). Plusieurs méthodes, à choisir selon vos ressources :
+
+| Méthode | Analyses par passage | Ressources |
+|---|---|---|
+| **Image entière réduite** (défaut) | 1 | La plus légère |
+| **Zone aléatoire** | 1 | Comme la précédente. Une zone carrée de l'écran est analysée, peu ou pas réduite ; à chaque passage la zone change (ordre aléatoire, tout l'écran est parcouru avant de repasser sur une zone). Une zone positive est ré-analysée telle quelle jusqu'à redevenir négative. |
+| **Mixte** | 2 | Image entière + zone aléatoire. |
+| **Grille 2×2 / 3×3 / 4×4** | 5 / 10 / 17 | Image entière + toutes les zones d'une grille fixe, à chaque passage. Le plus complet, mais environ 5 / 10 / 17 fois plus de calcul. |
+
+Les méthodes qui multiplient les analyses consomment nettement plus de processeur (ou de GPU) et **allongent
+le délai automatique** de l'image ; le filtre l'affiche dans les réglages. Activez « Journaliser scores et
+temps » pour voir le temps d'analyse réel sur votre machine. Une zone aléatoire trouve un élément en
+quelques passages (le temps d'un tour complet de l'écran), pas instantanément.
+
 ## Limites
 
 - **Ce n'est pas une garantie.** Un classifieur fait des faux positifs et des faux négatifs. Ne comptez pas
   dessus comme seule protection pour respecter les règles d'une plateforme.
-- La réduction en 224×224 se fait sans recadrage (pour couvrir tout l'écran) et de façon simple : de petits
-  détails sur un grand écran peuvent échapper à l'analyse.
+- Avec la méthode « image entière réduite », l'image est écrasée en 224×224 sans recadrage (pour couvrir tout
+  l'écran) : de petits détails sur un grand écran peuvent échapper à l'analyse. Les autres méthodes
+  atténuent ce défaut, au prix de plus de ressources.
 - Le délai laisse passer au plus quelques images avant le masque si l'option « Retarder l'image » est
   désactivée.
 - Windows 64 bits uniquement pour l'instant. Développé et testé avec OBS 32.2.2.
