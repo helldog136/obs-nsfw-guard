@@ -1,4 +1,4 @@
-# NSFW Guard — filtre OBS
+# NSFW Guard
 
 Un filtre vidéo pour [OBS Studio](https://obsproject.com) qui **masque une source dès que l'IA y détecte du
 contenu sensible** (noir, pixelisation ou flou gaussien). Il s'ajoute à n'importe quelle source : capture
@@ -70,6 +70,19 @@ scripts\install.ps1      # copie dans C:\ProgramData\obs-studio\plugins (OBS fer
 scripts\package.ps1      # crée dist\obs-nsfw-guard-<version>-windows-x64.zip
 scripts\installer.ps1    # crée l'installeur .exe (nécessite Inno Setup 6)
 ```
+
+## Transparence sur l'IA / AI disclosure
+
+Ce plugin a été développé avec l'aide d'un assistant de programmation IA
+([Claude](https://claude.com/claude-code), d'Anthropic) : l'essentiel du code (C++, scripts de compilation,
+CI, installeur) a été écrit par cet assistant sous la direction de l'auteur, qui l'a testé dans OBS Studio
+32.2.2 sous Windows. Le filtre s'appuie en outre sur un modèle de classification d'images (réseau de neurones)
+tiers, voir [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Si vous trouvez un défaut, ouvrez une issue.
+
+*This plugin was developed with the help of an AI coding assistant ([Claude](https://claude.com/claude-code)
+by Anthropic): most of the code (C++, build scripts, CI, installer) was written by the assistant under the
+author's direction, and tested by the author in OBS Studio 32.2.2 on Windows. The filter also relies on a
+third-party neural-network image classifier (see THIRD_PARTY_NOTICES.md).*
 
 ## Licence
 
