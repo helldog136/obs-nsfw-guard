@@ -18,40 +18,40 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Vérifier que le tag correspond à la version du projet
+      - name: VÃ©rifier que le tag correspond Ã  la version du projet
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           $tag = '${{ github.ref_name }}'.TrimStart('v')
           $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(obs-nsfw-guard VERSION ([\d.]+)').Matches[0].Groups[1].Value
-          if ($tag -ne $version) { throw "Le tag v$tag ne correspond pas à la version du CMakeLists.txt ($version)" }
+          if ($tag -ne $version) { throw "Le tag v$tag ne correspond pas Ã  la version du CMakeLists.txt ($version)" }
 
-      - name: Cache des dépendances
-        uses: actions/cache@v4
+      - name: Cache des dÃ©pendances
+        uses: actions/cache@v6
         with:
           path: |
             deps
             models
           key: deps-${{ hashFiles('scripts/fetch-deps.ps1') }}
 
-      - name: Récupérer les dépendances
+      - name: RÃ©cupÃ©rer les dÃ©pendances
         run: ./scripts/fetch-deps.ps1 -DownloadObs
 
       - name: Compiler
         run: ./scripts/build.ps1
 
-      - name: Créer l'archive
+      - name: CrÃ©er l'archive
         run: ./scripts/package.ps1
 
-      - name: Somme de contrôle
+      - name: Somme de contrÃ´le
         run: |
           Get-ChildItem dist/*.zip | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)" | Set-Content "$($_.FullName).sha256" -Encoding ascii
           }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: obs-nsfw-guard-windows-x64
           path: dist/*
@@ -65,12 +65,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: obs-nsfw-guard-windows-x64
           path: dist
 
-      - name: Créer la release GitHub
+      - name: CrÃ©er la release GitHub
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
