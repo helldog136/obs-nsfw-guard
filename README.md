@@ -22,11 +22,15 @@ Radeon RX 6900 XT). C'est une mesure sur une machine, pas une garantie.
 ## Installation (Windows 64 bits, OBS 32.x)
 
 1. Fermez OBS.
-2. Téléchargez l'archive `obs-nsfw-guard-*-windows-x64.zip` depuis les [Releases](../../releases).
-3. Extrayez-la dans `C:\ProgramData\obs-studio\plugins` (le dossier `obs-nsfw-guard` doit se retrouver dedans).
-4. Relancez OBS, puis : clic droit sur une source → **Filtres** → **+** → **NSFW Guard**.
+2. Téléchargez `obs-nsfw-guard-*-windows-x64-setup.exe` depuis les [Releases](../../releases) et lancez-le.
+3. Relancez OBS, puis : clic droit sur une source → **Filtres** → **+** → **NSFW Guard**.
 
-Désinstallation : supprimez `C:\ProgramData\obs-studio\plugins\obs-nsfw-guard`.
+Désinstallation : « Applications installées » de Windows (ou `unins000.exe` dans le dossier du plugin).
+
+Installation manuelle : extrayez plutôt `obs-nsfw-guard-*-windows-x64.zip` dans
+`C:\ProgramData\obs-studio\plugins` (le dossier `obs-nsfw-guard` doit se retrouver dedans).
+L'installeur n'est pas signé : Windows SmartScreen peut afficher un avertissement
+(« Informations complémentaires » → « Exécuter quand même »).
 
 ## Réglages
 
@@ -64,6 +68,7 @@ scripts\fetch-deps.ps1   # en-têtes OBS, obs.lib, ONNX Runtime, modèle
 scripts\build.ps1        # compile dans stage\obs-nsfw-guard
 scripts\install.ps1      # copie dans C:\ProgramData\obs-studio\plugins (OBS fermé)
 scripts\package.ps1      # crée dist\obs-nsfw-guard-<version>-windows-x64.zip
+scripts\installer.ps1    # crée l'installeur .exe (nécessite Inno Setup 6)
 ```
 
 ## Licence
@@ -80,6 +85,6 @@ when a small on-device ONNX classifier detects sensitive content. It has a built
 lands *before* the detected frame is shown, no separate Render Delay filter needed. Inference runs on a
 worker thread (about 1.3 ms/frame on a Ryzen 7 5800X CPU) and everything stays local.
 
-Windows x64 only, developed against OBS 32.2.2. Unzip a release into `C:\ProgramData\obs-studio\plugins`,
-restart OBS, and add **NSFW Guard** from a source's Filters dialog. It is not a guarantee: classifiers make
+Windows x64 only, developed against OBS 32.2.2. Run the `-setup.exe` from the latest release (or unzip the
+zip into `C:\ProgramData\obs-studio\plugins`), restart OBS, and add **NSFW Guard** from a source's Filters dialog. It is not a guarantee: classifiers make
 mistakes. Licensed GPL-2.0-or-later.
