@@ -1,0 +1,12 @@
+# Produits de compilation
+build/
+stage/
+dist/
+
+# Dépendances téléchargées par scripts/fetch-deps.ps1
+deps/
+models/
+
+# Divers
+.vs/
+*.user
