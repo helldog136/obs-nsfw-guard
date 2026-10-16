@@ -666,8 +666,9 @@ static bool engine_toggled(obs_properties_t *props, obs_property_t *, obs_data_t
 	obs_property_set_visible(obs_properties_get(props, S_LOCALIZED), det);
 	obs_property_set_visible(obs_properties_get(props, S_REGION_MARGIN),
 				 det && obs_data_get_bool(s, S_LOCALIZED));
+	// Avertissement : le gros modèle et/ou le GPU (DirectML) sont déconseillés (voir les textes).
 	obs_property_set_visible(obs_properties_get(props, S_ENGINE_WARNING),
-				 engine == ENGINE_NUDENET_640M && !obs_data_get_bool(s, S_USE_DML));
+				 engine == ENGINE_NUDENET_640M || obs_data_get_bool(s, S_USE_DML));
 	return true;
 }
 

@@ -45,7 +45,7 @@ L'installeur n'est pas signé : Windows SmartScreen peut afficher un avertisseme
 | Méthode d'analyse | Ce qui est envoyé au modèle : image entière réduite, zone aléatoire, mixte ou grille de zones. Voir ci-dessous. |
 | Taille de la zone aléatoire | Côté (en pixels de la source) de la zone analysée en mode « zone aléatoire » ou « mixte ». |
 | Analyser une image sur | Fréquence d'analyse (1 = chaque image). |
-| GPU (DirectML) | Utilise le GPU au lieu du CPU. Le CPU suffit et ne concurrence pas le jeu. |
+| GPU (DirectML) | Utilise le GPU au lieu du CPU. Le CPU suffit et ne concurrence pas le jeu. À éviter en cas de doute : un blocage complet d'un PC a été observé une fois en testant le GPU avec un gros modèle, sans que la cause soit établie. |
 | Masquer tant que le modèle n'est pas prêt | La source reste masquée pendant le chargement du modèle. |
 | Journaliser scores et temps | Écrit score, temps d'inférence, latence et délai dans le journal d'OBS pour calibrer le seuil. |
 
