@@ -19,11 +19,13 @@
 #include <mutex>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "classifier.h"
+#include "detector.h"
 #include "nsfw-filter.h"
 
 #define FILTER_ID "nsfw_guard_filter"
@@ -41,6 +43,40 @@
 #define S_METHOD "method"             // méthode d'analyse, voir enum Method
 #define S_METHOD_WARNING "method_warning"
 #define S_ZONE_SIZE "zone_size"       // côté (px de la source) de la zone aléatoire
+#define S_ENGINE "engine"             // moteur d'analyse, voir enum Engine
+#define S_ENGINE_WARNING "engine_warning"
+#define S_DET_THRESHOLD "det_threshold" // % : confiance minimale d'une détection NudeNet
+#define S_LOCALIZED "localized"       // ne masquer que la zone détectée (moteurs NudeNet)
+#define S_REGION_MARGIN "region_margin" // % : marge ajoutée autour d'une zone détectée
+#define S_CLASSES_GROUP "classes_group"
+#define S_CLASS_PREFIX "cls_"         // cls_0 .. cls_17 : classes NudeNet qui déclenchent le masque
+
+// Moteur d'analyse. Valeurs stockées dans les réglages : ne pas renuméroter.
+enum Engine {
+	ENGINE_MOBILENET = 0,   // classifieur MobileNet livré avec le plugin
+	ENGINE_NUDENET_320N = 1, // détecteur NudeNet 320n (petit, rapide)
+	ENGINE_NUDENET_640M = 2, // détecteur NudeNet 640m (précis, plus lourd)
+};
+
+static int engine_side(int engine)
+{
+	return engine == ENGINE_NUDENET_320N ? 320 : engine == ENGINE_NUDENET_640M ? 640 : kInputSize;
+}
+
+// Classes NudeNet qui déclenchent le masque par défaut : tout ce qui est explicite.
+static bool class_default_on(int cls)
+{
+	switch (cls) {
+	case 2:  // BUTTOCKS_EXPOSED
+	case 3:  // FEMALE_BREAST_EXPOSED
+	case 4:  // FEMALE_GENITALIA_EXPOSED
+	case 6:  // ANUS_EXPOSED
+	case 14: // MALE_GENITALIA_EXPOSED
+		return true;
+	default:
+		return false;
+	}
+}
 
 // Méthode d'analyse. Valeurs stockées dans les réglages : ne pas renuméroter.
 enum Method {
@@ -52,11 +88,24 @@ enum Method {
 	METHOD_MIXED = 5,   // l'image entière + une zone aléatoire
 };
 
-// Une "vue" est une image 224x224 envoyée au modèle, découpée dans l'image de la
-// source : l'image entière, une zone d'une grille, ou la zone aléatoire.
+// Une "vue" est une image carrée (224 pour le classifieur, 320 ou 640 pour NudeNet)
+// envoyée au modèle, découpée dans l'image de la source : l'image entière, une zone
+// d'une grille, ou la zone aléatoire.
 constexpr int kMaxViews = 17;                 // 1 + 4x4
-constexpr size_t kPlaneBytes = static_cast<size_t>(kInputSize) * kInputSize * 4;
 constexpr int kMaxPyramid = 6;                // niveaux de réduction par 2 (4K -> 3840/2^5 = 120)
+constexpr int kMaxRegions = 16;               // zones masquées simultanément (mode localisé)
+constexpr float kDetFloor = 0.15f;            // score en dessous duquel une détection est ignorée d'office
+
+struct ViewRect {
+	float x, y, w, h; // en pixels de l'image pleine taille
+};
+
+// Zone de l'image actuellement masquée (mode localisé), en pixels de la source.
+struct Region {
+	float x, y, w, h;
+	uint64_t start_id; // le masque s'applique aux images affichées à partir de celle-ci
+	uint64_t last_ns;  // dernière confirmation, pour le maintien
+};
 #define S_DELAY_ON "delay_on"         // retarder l'image pour que le masque arrive à temps
 #define S_AUTO_DELAY "auto_delay"     // calculer le délai automatiquement
 #define S_DELAY_FRAMES "delay_frames" // délai manuel, en images
@@ -177,6 +226,12 @@ struct nsfw_filter {
 	std::atomic<int> blur_strength{30};
 	std::atomic<int> method{METHOD_WHOLE};
 	std::atomic<int> zone_size{448};
+	std::atomic<int> engine{ENGINE_MOBILENET};
+	std::atomic<float> det_threshold{0.40f};
+	std::atomic<bool> localized{true};
+	std::atomic<float> region_margin{0.25f};
+	std::atomic<uint32_t> class_mask{0}; // bit i = la classe NudeNet i déclenche le masque
+	std::atomic<bool> det_failed{false}; // détecteur indisponible : repli sur le classifieur
 	std::atomic<bool> delay_on{true};
 	std::atomic<bool> auto_delay{true};
 	std::atomic<int> delay_frames{3};
@@ -195,11 +250,18 @@ struct nsfw_filter {
 	bool stage_valid[2] = {false, false};
 	uint64_t stage_frame[2] = {0, 0};
 	int stage_views[2] = {0, 0};
+	int stage_side[2] = {0, 0};
+	int stage_engine[2] = {0, 0};
+	ViewRect stage_rect[2][kMaxViews] = {};
 	int stage_zone_view[2] = {-1, -1};
 	float stage_zone_x[2] = {0.0f, 0.0f};
 	float stage_zone_y[2] = {0.0f, 0.0f};
 	int stage_idx = 0;
+	int surf_side = 0; // côté des surfaces de rapatriement actuellement créées
 	std::vector<uint8_t> map_buf;
+
+	// --- zones masquées (mode localisé, thread graphique) ---
+	std::vector<Region> regions;
 
 	// --- zone aléatoire (thread graphique) ---
 	// Les zones sont parcourues dans un ordre aléatoire, sans répétition, jusqu'à
@@ -241,21 +303,29 @@ struct nsfw_filter {
 	std::condition_variable job_cv;
 	bool quit = false;
 	bool has_job = false;
-	std::vector<uint8_t> job_buf; // kMaxViews plans de kPlaneBytes
+	std::vector<uint8_t> job_buf; // `job_views` plans consécutifs de job_side x job_side x 4 octets
 	int job_views = 0;
+	int job_engine = ENGINE_MOBILENET;
+	int job_side = kInputSize;
+	ViewRect job_rect[kMaxViews] = {};
 	int job_zone_view = -1; // index de la vue "zone aléatoire" (-1 : aucune)
 	float job_zone_x = 0.0f, job_zone_y = 0.0f;
 	uint64_t job_frame = 0;
 	uint64_t job_submit_ns = 0;
 	std::wstring model_path;
+	std::wstring det_path[2]; // NudeNet 320n, 640m ; vide si le fichier est absent
 
 	std::mutex res_m;
 	bool has_result = false;
 	uint64_t res_frame = 0;
 	int res_views = 0;
+	int res_engine = ENGINE_MOBILENET;
+	int res_side = kInputSize;
+	ViewRect res_rect[kMaxViews] = {};
 	int res_zone_view = -1;
 	float res_zone_x = 0.0f, res_zone_y = 0.0f;
-	float res_probs[kMaxViews][kNumClasses] = {};
+	float res_probs[kMaxViews][kNumClasses] = {}; // classifieur
+	std::vector<Detection> res_dets;               // détecteur (toutes vues confondues)
 	float res_lat_ms = 0.0f;
 	float res_infer_ms = 0.0f;
 
@@ -269,17 +339,24 @@ struct nsfw_filter {
 static void worker_main(nsfw_filter *f)
 {
 	std::unique_ptr<Classifier> clf;
-	bool loaded_dml = false;
-	bool failed = false;
-	bool failed_dml = false;
+	bool clf_dml = false;
+	bool clf_failed = false;
+	bool clf_failed_dml = false;
 
-	std::vector<uint8_t> buf(kPlaneBytes * kMaxViews);
+	std::unique_ptr<Detector> det;
+	int det_engine = -1;
+	bool det_dml = false;
+
+	std::vector<uint8_t> buf;
+	std::vector<Detection> dets, view_dets;
 
 	for (;;) {
 		uint64_t frame = 0, submit_ns = 0;
-		int views = 0;
+		int views = 0, engine = ENGINE_MOBILENET, side = kInputSize;
 		int zone_view = -1;
 		float zone_x = 0.0f, zone_y = 0.0f;
+		ViewRect rects[kMaxViews] = {};
+		std::wstring det_path;
 		{
 			std::unique_lock<std::mutex> lk(f->job_m);
 			f->job_cv.wait(lk, [&] { return f->quit || f->has_job; });
@@ -287,6 +364,11 @@ static void worker_main(nsfw_filter *f)
 				break;
 			buf.swap(f->job_buf);
 			views = f->job_views;
+			engine = f->job_engine;
+			side = f->job_side;
+			std::copy(f->job_rect, f->job_rect + kMaxViews, rects);
+			if (engine == ENGINE_NUDENET_320N || engine == ENGINE_NUDENET_640M)
+				det_path = f->det_path[engine - 1];
 			zone_view = f->job_zone_view;
 			zone_x = f->job_zone_x;
 			zone_y = f->job_zone_y;
@@ -295,51 +377,113 @@ static void worker_main(nsfw_filter *f)
 			f->has_job = false;
 		}
 
+		views = std::clamp(views, 1, kMaxViews);
+		const size_t plane = static_cast<size_t>(side) * side * 4;
+		if (buf.size() < plane * static_cast<size_t>(views))
+			continue;
+
 		const bool want_dml = f->use_dml.load();
-		if ((!clf || want_dml != loaded_dml) && !(failed && failed_dml == want_dml)) {
-			clf.reset();
-			f->ready = false;
-			try {
-				clf = std::make_unique<Classifier>(f->model_path, want_dml);
-				loaded_dml = want_dml;
-				failed = false;
-				f->ready = true;
-				blog(LOG_INFO, LOG_PREFIX "modèle chargé (%s)", want_dml ? "GPU DirectML" : "CPU");
-			} catch (const std::exception &e) {
-				blog(LOG_ERROR, LOG_PREFIX "échec du chargement du modèle (%s) : %s",
-				     want_dml ? "DirectML" : "CPU", e.what());
-				failed = true;
-				failed_dml = want_dml;
-				if (want_dml) {
-					// Repli automatique sur le CPU.
-					try {
-						clf = std::make_unique<Classifier>(f->model_path, false);
-						loaded_dml = false;
-						failed = false;
-						f->ready = true;
-						blog(LOG_WARNING, LOG_PREFIX "repli sur le CPU");
-					} catch (const std::exception &e2) {
-						blog(LOG_ERROR, LOG_PREFIX "échec du repli CPU : %s", e2.what());
+		float probs[kMaxViews][kNumClasses];
+		float infer_ms = 0.0f;
+		dets.clear();
+
+		if (engine == ENGINE_MOBILENET) {
+			if ((!clf || want_dml != clf_dml) && !(clf_failed && clf_failed_dml == want_dml)) {
+				clf.reset();
+				f->ready = false;
+				try {
+					clf = std::make_unique<Classifier>(f->model_path, want_dml);
+					clf_dml = want_dml;
+					clf_failed = false;
+					blog(LOG_INFO, LOG_PREFIX "modèle chargé (%s)", want_dml ? "GPU DirectML" : "CPU");
+				} catch (const std::exception &e) {
+					blog(LOG_ERROR, LOG_PREFIX "échec du chargement du modèle (%s) : %s",
+					     want_dml ? "DirectML" : "CPU", e.what());
+					clf_failed = true;
+					clf_failed_dml = want_dml;
+					if (want_dml) {
+						// Repli automatique sur le CPU.
+						try {
+							clf = std::make_unique<Classifier>(f->model_path, false);
+							clf_dml = false;
+							clf_failed = false;
+							blog(LOG_WARNING, LOG_PREFIX "repli sur le CPU");
+						} catch (const std::exception &e2) {
+							blog(LOG_ERROR, LOG_PREFIX "échec du repli CPU : %s", e2.what());
+						}
 					}
 				}
 			}
-		}
-		if (!clf)
-			continue;
+			if (!clf)
+				continue;
+			f->ready = true;
 
-		views = std::clamp(views, 1, kMaxViews);
-		float probs[kMaxViews][kNumClasses];
-		float infer_ms = 0.0f;
-		try {
-			for (int v = 0; v < views; v++) {
-				float ms = 0.0f;
-				if (!clf->Run(buf.data() + static_cast<size_t>(v) * kPlaneBytes, kInputSize * 4, probs[v], ms))
-					throw std::runtime_error("inférence sans résultat");
-				infer_ms += ms;
+			try {
+				for (int v = 0; v < views; v++) {
+					float ms = 0.0f;
+					if (!clf->Run(buf.data() + static_cast<size_t>(v) * plane, side * 4, probs[v], ms))
+						throw std::runtime_error("inférence sans résultat");
+					infer_ms += ms;
+				}
+			} catch (const std::exception &e) {
+				blog(LOG_ERROR, LOG_PREFIX "erreur d'inférence : %s", e.what());
+				continue;
 			}
-		} catch (const std::exception &e) {
-			blog(LOG_ERROR, LOG_PREFIX "erreur d'inférence : %s", e.what());
-			continue;
+		} else {
+			if (!det || det_engine != engine || det_dml != want_dml) {
+				det.reset();
+				f->ready = false;
+				const char *name = engine == ENGINE_NUDENET_320N ? "NudeNet 320n" : "NudeNet 640m";
+				if (det_path.empty()) {
+					blog(LOG_ERROR,
+					     LOG_PREFIX "%s : fichier modèle introuvable dans les données du plugin ; repli sur le classifieur MobileNet",
+					     name);
+					f->det_failed = true;
+					continue;
+				}
+				try {
+					det = std::make_unique<Detector>(det_path, want_dml, side);
+					det_dml = want_dml;
+					det_engine = engine;
+					blog(LOG_INFO, LOG_PREFIX "%s chargé (%s)", name, want_dml ? "GPU DirectML" : "CPU");
+				} catch (const std::exception &e) {
+					blog(LOG_ERROR, LOG_PREFIX "échec du chargement de %s (%s) : %s", name,
+					     want_dml ? "DirectML" : "CPU", e.what());
+					if (want_dml) {
+						try {
+							det = std::make_unique<Detector>(det_path, false, side);
+							det_dml = false;
+							det_engine = engine;
+							blog(LOG_WARNING, LOG_PREFIX "repli sur le CPU");
+						} catch (const std::exception &e2) {
+							blog(LOG_ERROR, LOG_PREFIX "échec du repli CPU : %s", e2.what());
+						}
+					}
+					if (!det) {
+						blog(LOG_ERROR, LOG_PREFIX "repli sur le classifieur MobileNet");
+						f->det_failed = true;
+						continue;
+					}
+				}
+			}
+			f->ready = true;
+
+			try {
+				for (int v = 0; v < views; v++) {
+					float ms = 0.0f;
+					if (!det->Run(buf.data() + static_cast<size_t>(v) * plane, side * 4, kDetFloor, view_dets,
+						      ms))
+						throw std::runtime_error("inférence sans résultat");
+					infer_ms += ms;
+					for (Detection d : view_dets) {
+						d.view = v;
+						dets.push_back(d);
+					}
+				}
+			} catch (const std::exception &e) {
+				blog(LOG_ERROR, LOG_PREFIX "erreur d'inférence : %s", e.what());
+				continue;
+			}
 		}
 
 		const uint64_t now = os_gettime_ns();
@@ -347,10 +491,15 @@ static void worker_main(nsfw_filter *f)
 		f->has_result = true;
 		f->res_frame = frame;
 		f->res_views = views;
+		f->res_engine = engine;
+		f->res_side = side;
+		std::copy(rects, rects + kMaxViews, f->res_rect);
 		f->res_zone_view = zone_view;
 		f->res_zone_x = zone_x;
 		f->res_zone_y = zone_y;
-		std::memcpy(f->res_probs, probs, sizeof(float) * kNumClasses * static_cast<size_t>(views));
+		if (engine == ENGINE_MOBILENET)
+			std::memcpy(f->res_probs, probs, sizeof(float) * kNumClasses * static_cast<size_t>(views));
+		f->res_dets = dets;
 		f->res_lat_ms = static_cast<float>(now - submit_ns) / 1.0e6f;
 		f->res_infer_ms = infer_ms;
 	}
@@ -365,9 +514,50 @@ static const char *filter_get_name(void *)
 	return obs_module_text("NsfwGuard");
 }
 
+// Chemin (UTF-16) d'un fichier des données du plugin ; vide s'il n'existe pas.
+static std::wstring module_file_wide(const char *name)
+{
+	std::wstring result;
+	char *path = obs_module_file(name);
+	if (path) {
+		wchar_t *wide = nullptr;
+		os_utf8_to_wcs_ptr(path, 0, &wide);
+		if (wide) {
+			result = wide;
+			bfree(wide);
+		}
+		bfree(path);
+	}
+	return result;
+}
+
 static void filter_update(void *data, obs_data_t *s)
 {
 	auto *f = static_cast<nsfw_filter *>(data);
+
+	// Les modèles NudeNet ne sont pas livrés avec le plugin : on les cherche à chaque
+	// mise à jour, pour qu'un fichier ajouté après coup soit pris en compte.
+	{
+		const std::wstring p320 = module_file_wide("nudenet_320n.onnx");
+		const std::wstring p640 = module_file_wide("nudenet_640m.onnx");
+		std::lock_guard<std::mutex> lk(f->job_m);
+		f->det_path[0] = p320;
+		f->det_path[1] = p640;
+	}
+	f->det_failed = false;
+
+	f->engine = std::clamp(static_cast<int>(obs_data_get_int(s, S_ENGINE)), 0, static_cast<int>(ENGINE_NUDENET_640M));
+	f->det_threshold = static_cast<float>(obs_data_get_int(s, S_DET_THRESHOLD)) / 100.0f;
+	f->localized = obs_data_get_bool(s, S_LOCALIZED);
+	f->region_margin = static_cast<float>(obs_data_get_int(s, S_REGION_MARGIN)) / 100.0f;
+	uint32_t mask = 0;
+	for (int c = 0; c < kDetNumClasses; c++) {
+		const std::string key = std::string(S_CLASS_PREFIX) + std::to_string(c);
+		if (obs_data_get_bool(s, key.c_str()))
+			mask |= 1u << c;
+	}
+	f->class_mask = mask;
+
 	f->threshold = static_cast<float>(obs_data_get_int(s, S_THRESHOLD)) / 100.0f;
 	f->sexy_weight = static_cast<float>(obs_data_get_int(s, S_SEXY_WEIGHT)) / 100.0f;
 	f->consecutive = static_cast<int>(obs_data_get_int(s, S_CONSECUTIVE));
@@ -390,21 +580,9 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	auto *f = new nsfw_filter();
 	f->self = source;
-	f->job_buf.resize(kPlaneBytes * kMaxViews);
-	f->map_buf.resize(kPlaneBytes * kMaxViews);
-
-	char *model = obs_module_file("nsfw_model.onnx");
-	if (model) {
-		wchar_t *wide = nullptr;
-		os_utf8_to_wcs_ptr(model, 0, &wide);
-		if (wide) {
-			f->model_path = wide;
-			bfree(wide);
-		}
-		bfree(model);
-	} else {
+	f->model_path = module_file_wide("nsfw_model.onnx");
+	if (f->model_path.empty())
 		blog(LOG_ERROR, LOG_PREFIX "nsfw_model.onnx introuvable dans les données du plugin");
-	}
 
 	std::string err;
 	if (!ClassifierGlobalInit(g_module_dir, err))
@@ -476,6 +654,23 @@ static bool mode_toggled(obs_properties_t *props, obs_property_t *, obs_data_t *
 	return true;
 }
 
+// Affiche ou masque les réglages selon le moteur (classifieur ou détecteur NudeNet).
+static bool engine_toggled(obs_properties_t *props, obs_property_t *, obs_data_t *s)
+{
+	const int engine = static_cast<int>(obs_data_get_int(s, S_ENGINE));
+	const bool det = engine != ENGINE_MOBILENET;
+	obs_property_set_visible(obs_properties_get(props, S_THRESHOLD), !det);
+	obs_property_set_visible(obs_properties_get(props, S_SEXY_WEIGHT), !det);
+	obs_property_set_visible(obs_properties_get(props, S_DET_THRESHOLD), det);
+	obs_property_set_visible(obs_properties_get(props, S_CLASSES_GROUP), det);
+	obs_property_set_visible(obs_properties_get(props, S_LOCALIZED), det);
+	obs_property_set_visible(obs_properties_get(props, S_REGION_MARGIN),
+				 det && obs_data_get_bool(s, S_LOCALIZED));
+	obs_property_set_visible(obs_properties_get(props, S_ENGINE_WARNING),
+				 engine == ENGINE_NUDENET_640M && !obs_data_get_bool(s, S_USE_DML));
+	return true;
+}
+
 static bool method_toggled(obs_properties_t *props, obs_property_t *, obs_data_t *s)
 {
 	const int method = static_cast<int>(obs_data_get_int(s, S_METHOD));
@@ -500,11 +695,40 @@ static obs_properties_t *filter_properties(void *)
 {
 	obs_properties_t *p = obs_properties_create();
 
-	obs_property_t *prop = obs_properties_add_int_slider(p, S_THRESHOLD, obs_module_text("Threshold"), 1, 100, 1);
+	obs_property_t *prop = obs_properties_add_list(p, S_ENGINE, obs_module_text("Engine"), OBS_COMBO_TYPE_LIST,
+						       OBS_COMBO_FORMAT_INT);
+	obs_property_set_long_description(prop, obs_module_text("Engine.Desc"));
+	obs_property_list_add_int(prop, obs_module_text("Engine.MobileNet"), ENGINE_MOBILENET);
+	obs_property_list_add_int(prop, obs_module_text("Engine.NudeNet320n"), ENGINE_NUDENET_320N);
+	obs_property_list_add_int(prop, obs_module_text("Engine.NudeNet640m"), ENGINE_NUDENET_640M);
+	obs_property_set_modified_callback(prop, engine_toggled);
+
+	// Le texte affiché d'un champ d'information est la valeur du réglage (voir les défauts).
+	prop = obs_properties_add_text(p, S_ENGINE_WARNING, obs_module_text("Engine.WarningLabel"), OBS_TEXT_INFO);
+	obs_property_text_set_info_type(prop, OBS_TEXT_INFO_WARNING);
+
+	prop = obs_properties_add_int_slider(p, S_THRESHOLD, obs_module_text("Threshold"), 1, 100, 1);
 	obs_property_set_long_description(prop, obs_module_text("Threshold.Desc"));
 
 	prop = obs_properties_add_int_slider(p, S_SEXY_WEIGHT, obs_module_text("SexyWeight"), 0, 100, 1);
 	obs_property_set_long_description(prop, obs_module_text("SexyWeight.Desc"));
+
+	prop = obs_properties_add_int_slider(p, S_DET_THRESHOLD, obs_module_text("DetThreshold"), 15, 100, 1);
+	obs_property_set_long_description(prop, obs_module_text("DetThreshold.Desc"));
+
+	obs_properties_t *classes = obs_properties_create();
+	for (int c = 0; c < kDetNumClasses; c++) {
+		const std::string key = std::string(S_CLASS_PREFIX) + std::to_string(c);
+		const std::string label = "Class." + std::to_string(c);
+		obs_properties_add_bool(classes, key.c_str(), obs_module_text(label.c_str()));
+	}
+	obs_properties_add_group(p, S_CLASSES_GROUP, obs_module_text("Classes"), OBS_GROUP_NORMAL, classes);
+
+	prop = obs_properties_add_bool(p, S_LOCALIZED, obs_module_text("Localized"));
+	obs_property_set_long_description(prop, obs_module_text("Localized.Desc"));
+	obs_property_set_modified_callback(prop, engine_toggled);
+	prop = obs_properties_add_int_slider(p, S_REGION_MARGIN, obs_module_text("RegionMargin"), 0, 100, 5);
+	obs_property_set_long_description(prop, obs_module_text("RegionMargin.Desc"));
 
 	prop = obs_properties_add_int_slider(p, S_CONSECUTIVE, obs_module_text("Consecutive"), 1, 30, 1);
 	obs_property_set_long_description(prop, obs_module_text("Consecutive.Desc"));
@@ -552,6 +776,7 @@ static obs_properties_t *filter_properties(void *)
 
 	prop = obs_properties_add_bool(p, S_USE_DML, obs_module_text("UseDml"));
 	obs_property_set_long_description(prop, obs_module_text("UseDml.Desc"));
+	obs_property_set_modified_callback(prop, engine_toggled);
 	obs_properties_add_bool(p, S_BLOCK_UNTIL_READY, obs_module_text("BlockUntilReady"));
 	obs_properties_add_bool(p, S_DEBUG, obs_module_text("Debug"));
 
@@ -560,6 +785,15 @@ static obs_properties_t *filter_properties(void *)
 
 static void filter_defaults(obs_data_t *s)
 {
+	obs_data_set_default_int(s, S_ENGINE, ENGINE_MOBILENET);
+	obs_data_set_default_string(s, S_ENGINE_WARNING, obs_module_text("Engine.Warning"));
+	obs_data_set_default_int(s, S_DET_THRESHOLD, 40);
+	obs_data_set_default_bool(s, S_LOCALIZED, true);
+	obs_data_set_default_int(s, S_REGION_MARGIN, 25);
+	for (int c = 0; c < kDetNumClasses; c++) {
+		const std::string key = std::string(S_CLASS_PREFIX) + std::to_string(c);
+		obs_data_set_default_bool(s, key.c_str(), class_default_on(c));
+	}
 	obs_data_set_default_int(s, S_THRESHOLD, 60);
 	obs_data_set_default_int(s, S_SEXY_WEIGHT, 25);
 	obs_data_set_default_int(s, S_CONSECUTIVE, 2);
@@ -596,11 +830,65 @@ static float frame_ms()
 	return 16.7f;
 }
 
+static const char *const kClassNames[kDetNumClasses] = {
+	"FEMALE_GENITALIA_COVERED", "FACE_FEMALE",        "BUTTOCKS_EXPOSED",     "FEMALE_BREAST_EXPOSED",
+	"FEMALE_GENITALIA_EXPOSED", "MALE_BREAST_EXPOSED", "ANUS_EXPOSED",         "FEET_EXPOSED",
+	"BELLY_COVERED",            "FEET_COVERED",        "ARMPITS_COVERED",      "ARMPITS_EXPOSED",
+	"FACE_MALE",                "BELLY_EXPOSED",       "MALE_GENITALIA_EXPOSED", "ANUS_COVERED",
+	"FEMALE_BREAST_COVERED",    "BUTTOCKS_COVERED",
+};
+
+static float rect_iou(const ViewRect &a, const ViewRect &b)
+{
+	const float x0 = std::max(a.x, b.x), y0 = std::max(a.y, b.y);
+	const float x1 = std::min(a.x + a.w, b.x + b.w), y1 = std::min(a.y + a.h, b.y + b.h);
+	const float inter = std::max(0.0f, x1 - x0) * std::max(0.0f, y1 - y0);
+	const float uni = a.w * a.h + b.w * b.h - inter;
+	return uni > 0.0f ? inter / uni : 0.0f;
+}
+
+// Ajoute (ou met à jour) la zone masquée correspondant à une détection. `r` est la
+// zone de la source qui a été envoyée au modèle : l'image y est collée en haut à
+// gauche d'un carré (le reste est du noir), à l'échelle max(r.w, r.h) / side.
+static void add_region(nsfw_filter *f, const Detection &d, const ViewRect &r, int side, uint64_t start_id,
+		       uint64_t now_ns)
+{
+	const float scale = std::max(r.w, r.h) / static_cast<float>(side);
+	float x0 = r.x + d.x * scale, y0 = r.y + d.y * scale;
+	float x1 = x0 + d.w * scale, y1 = y0 + d.h * scale;
+
+	// Marge autour de la détection, proportionnelle à sa taille.
+	const float m = f->region_margin.load() * std::max(x1 - x0, y1 - y0);
+	x0 = std::clamp(x0 - m, 0.0f, static_cast<float>(f->w));
+	y0 = std::clamp(y0 - m, 0.0f, static_cast<float>(f->h));
+	x1 = std::clamp(x1 + m, 0.0f, static_cast<float>(f->w));
+	y1 = std::clamp(y1 + m, 0.0f, static_cast<float>(f->h));
+	if (x1 - x0 < 1.0f || y1 - y0 < 1.0f)
+		return;
+
+	const ViewRect nr = {x0, y0, x1 - x0, y1 - y0};
+	for (Region &e : f->regions) {
+		if (rect_iou({e.x, e.y, e.w, e.h}, nr) > 0.3f) {
+			// Même objet qu'à l'analyse précédente : la zone suit son déplacement.
+			e.x = nr.x;
+			e.y = nr.y;
+			e.w = nr.w;
+			e.h = nr.h;
+			e.last_ns = now_ns;
+			return;
+		}
+	}
+	if (static_cast<int>(f->regions.size()) < kMaxRegions)
+		f->regions.push_back({nr.x, nr.y, nr.w, nr.h, start_id, now_ns});
+}
+
 static void consume_result(nsfw_filter *f)
 {
 	float probs[kMaxViews][kNumClasses];
+	std::vector<Detection> dets;
+	ViewRect rects[kMaxViews];
 	uint64_t frame;
-	int views, zone_view;
+	int views, zone_view, engine, side;
 	float zone_x, zone_y;
 	float lat_ms, infer_ms;
 	{
@@ -610,33 +898,50 @@ static void consume_result(nsfw_filter *f)
 		f->has_result = false;
 		frame = f->res_frame;
 		views = f->res_views;
+		engine = f->res_engine;
+		side = f->res_side;
+		std::copy(f->res_rect, f->res_rect + kMaxViews, rects);
 		zone_view = f->res_zone_view;
 		zone_x = f->res_zone_x;
 		zone_y = f->res_zone_y;
 		lat_ms = f->res_lat_ms;
 		infer_ms = f->res_infer_ms;
-		std::memcpy(probs, f->res_probs, sizeof(float) * kNumClasses * static_cast<size_t>(views));
+		if (engine == ENGINE_MOBILENET)
+			std::memcpy(probs, f->res_probs, sizeof(float) * kNumClasses * static_cast<size_t>(views));
+		else
+			dets = f->res_dets;
 	}
 
 	f->lat_ms_ema = 0.9f * f->lat_ms_ema + 0.1f * lat_ms;
 
-	// Le score de l'image est celui de sa vue la plus sensible : il suffit qu'une
-	// zone soit jugée sensible pour que l'image le soit.
-	const float sexy_weight = f->sexy_weight.load();
-	const float threshold = f->threshold.load();
+	const bool det_engine = engine != ENGINE_MOBILENET;
+	const float threshold = det_engine ? f->det_threshold.load() : f->threshold.load();
+	const uint32_t class_mask = f->class_mask.load();
+
+	// Score de chaque vue : classifieur = formule porn + hentai + poids x sexy ;
+	// détecteur = meilleure confiance parmi les classes qui déclenchent le masque.
+	float view_score[kMaxViews] = {};
+	if (!det_engine) {
+		const float sexy_weight = f->sexy_weight.load();
+		for (int v = 0; v < views; v++)
+			view_score[v] = std::min(1.0f, probs[v][kClassPorn] + probs[v][kClassHentai] +
+							       sexy_weight * probs[v][kClassSexy]);
+	} else {
+		for (const Detection &d : dets)
+			if (d.view >= 0 && d.view < views && ((class_mask >> d.cls) & 1u))
+				view_score[d.view] = std::max(view_score[d.view], d.score);
+	}
+
+	// L'image est sensible si une de ses vues l'est.
 	float score = 0.0f;
-	float zone_score = 0.0f;
 	int best_view = 0;
 	for (int v = 0; v < views; v++) {
-		const float s = std::min(1.0f, probs[v][kClassPorn] + probs[v][kClassHentai] +
-						       sexy_weight * probs[v][kClassSexy]);
-		if (v == zone_view)
-			zone_score = s;
-		if (s > score) {
-			score = s;
+		if (view_score[v] > score) {
+			score = view_score[v];
 			best_view = v;
 		}
 	}
+	const float zone_score = zone_view >= 0 && zone_view < views ? view_score[zone_view] : 0.0f;
 	f->last_score = score;
 
 	// Zone aléatoire : une zone positive est ré-analysée telle quelle ; dès qu'une
@@ -656,11 +961,25 @@ static void consume_result(nsfw_filter *f)
 	if (score >= threshold) {
 		f->streak++;
 		if (f->streak >= f->consecutive.load()) {
-			if (!f->mask_active) {
+			const uint64_t back = static_cast<uint64_t>(f->consecutive.load() - 1) *
+					      static_cast<uint64_t>(f->interval.load());
+			const uint64_t start_id = frame > back ? frame - back : 0;
+
+			if (det_engine && f->localized.load()) {
+				// Mode localisé : on ne masque que les cadres détectés.
+				const bool had_regions = !f->regions.empty();
+				for (const Detection &d : dets) {
+					if (d.view < 0 || d.view >= views || !((class_mask >> d.cls) & 1u) ||
+					    d.score < threshold)
+						continue;
+					add_region(f, d, rects[d.view], side, start_id, now);
+					if (!had_regions)
+						blog(LOG_INFO, LOG_PREFIX "détection %s (confiance %.2f) : zone masquée",
+						     kClassNames[d.cls], d.score);
+				}
+			} else if (!f->mask_active) {
 				f->mask_active = true;
-				const uint64_t back = static_cast<uint64_t>(f->consecutive.load() - 1) *
-						      static_cast<uint64_t>(f->interval.load());
-				f->mask_start_id = frame > back ? frame - back : 0;
+				f->mask_start_id = start_id;
 				if (best_view == zone_view)
 					blog(LOG_INFO,
 					     LOG_PREFIX "contenu sensible détecté (score %.2f, zone aléatoire en x=%.0f y=%.0f sur %ux%u) : masque activé",
@@ -677,10 +996,23 @@ static void consume_result(nsfw_filter *f)
 
 	if (f->debug) {
 		if (now - f->dbg_last_ns > 1000000000ULL) {
-			blog(LOG_INFO,
-			     LOG_PREFIX "score max=%.2f  dernier=%.2f (vue %d/%d) | inférence=%.2f ms  latence=%.2f ms | délai=%d img | masque=%s%s",
-			     f->dbg_max_score, score, best_view, views, infer_ms, f->lat_ms_ema, f->cur_delay,
-			     f->mask_active ? "OUI" : "non", f->zone_sticky ? " | zone verrouillée" : "");
+			if (det_engine)
+				blog(LOG_INFO,
+				     LOG_PREFIX "NudeNet : %zu détection(s), meilleur score retenu max=%.2f dernier=%.2f (vue %d/%d) | inférence=%.2f ms  latence=%.2f ms | délai=%d img | zones=%zu masque=%s%s",
+				     dets.size(), f->dbg_max_score, score, best_view, views, infer_ms, f->lat_ms_ema,
+				     f->cur_delay, f->regions.size(), f->mask_active ? "OUI" : "non",
+				     f->zone_sticky ? " | zone verrouillée" : "");
+			else
+				blog(LOG_INFO,
+				     LOG_PREFIX "score max=%.2f  dernier=%.2f (vue %d/%d) | inférence=%.2f ms  latence=%.2f ms | délai=%d img | masque=%s%s",
+				     f->dbg_max_score, score, best_view, views, infer_ms, f->lat_ms_ema, f->cur_delay,
+				     f->mask_active ? "OUI" : "non", f->zone_sticky ? " | zone verrouillée" : "");
+			if (det_engine) {
+				// Détail des détections (toutes classes) pour calibrer les réglages.
+				for (const Detection &d : dets)
+					blog(LOG_INFO, LOG_PREFIX "  vue %d : %s %.2f%s", d.view, kClassNames[d.cls], d.score,
+					     ((class_mask >> d.cls) & 1u) ? " [déclenche]" : "");
+			}
 			f->dbg_last_ns = now;
 			f->dbg_max_score = 0.0f;
 		}
@@ -695,6 +1027,7 @@ static void ensure_gfx(nsfw_filter *f, uint32_t w, uint32_t h, int delay)
 				gs_texrender_destroy(t);
 		f->ring.clear();
 		f->slot_id.clear();
+		f->regions.clear(); // coordonnées de l'ancienne résolution
 		f->w = w;
 		f->h = h;
 	}
@@ -733,14 +1066,23 @@ static void capture_target(nsfw_filter *f, obs_source_t *target, gs_texrender_t 
 
 // --- vues : ce qu'on envoie au modèle pour une image ------------------------
 
-struct ViewRect {
-	float x, y, w, h; // en pixels de l'image pleine taille
-};
+// Moteur réellement utilisé : le détecteur est abandonné (repli sur MobileNet) si son
+// modèle est introuvable ou n'a pas pu être chargé.
+static int effective_engine(const nsfw_filter *f)
+{
+	const int engine = f->engine.load();
+	return engine != ENGINE_MOBILENET && f->det_failed.load() ? ENGINE_MOBILENET : engine;
+}
 
 struct ViewPlan {
 	ViewRect rect[kMaxViews];
 	int count = 0;
-	int zone_view = -1; // index de la zone aléatoire dans rect[], -1 si aucune
+	int zone_view = -1;    // index de la zone aléatoire dans rect[], -1 si aucune
+	int engine = ENGINE_MOBILENET;
+	int side = kInputSize; // côté du carré envoyé au modèle
+	// NudeNet reçoit chaque vue sans déformation (collée en haut à gauche d'un carré
+	// noir) ; le classifieur reçoit la vue étirée à la taille du carré.
+	bool letterbox = false;
 };
 
 // Prochaine zone aléatoire de côté `s`, en pixels de la source. Les positions
@@ -786,6 +1128,9 @@ static void pick_zone(nsfw_filter *f, uint32_t s, float &x, float &y)
 static ViewPlan plan_views(nsfw_filter *f)
 {
 	ViewPlan plan;
+	plan.engine = effective_engine(f);
+	plan.side = engine_side(plan.engine);
+	plan.letterbox = plan.engine != ENGINE_MOBILENET;
 	const float W = static_cast<float>(f->w), H = static_cast<float>(f->h);
 	const int method = f->method.load();
 
@@ -811,13 +1156,14 @@ static ViewPlan plan_views(nsfw_filter *f)
 	return plan;
 }
 
-// Niveau de la pyramide à utiliser pour une vue : le plus réduit qui garde
-// encore au moins 224 px sur le plus petit côté (on ne sur-échantillonne jamais).
-static int pyramid_level_for(const ViewRect &r)
+// Niveau de la pyramide à utiliser pour une vue : le plus réduit qui garde encore
+// au moins `side` px (on ne sur-échantillonne jamais). Vue étirée : il faut `side`
+// px sur chaque côté ; vue sans déformation : sur le plus grand côté.
+static int pyramid_level_for(const ViewRect &r, int side, bool letterbox)
 {
-	const float smallest = std::min(r.w, r.h);
+	const float extent = letterbox ? std::max(r.w, r.h) : std::min(r.w, r.h);
 	int k = 0;
-	while (k + 1 < kMaxPyramid && smallest / static_cast<float>(1u << (k + 1)) >= static_cast<float>(kInputSize))
+	while (k + 1 < kMaxPyramid && extent / static_cast<float>(1u << (k + 1)) >= static_cast<float>(side))
 		k++;
 	return k;
 }
@@ -860,12 +1206,15 @@ static void build_pyramid(nsfw_filter *f, gs_texture_t *full, int max_level)
 	gs_blend_state_pop();
 }
 
-// Dessine la vue `v` en 224x224 dans small_tr. La zone à lire est choisie par la
-// projection (gs_ortho) : elle est mise à l'échelle du viewport 224x224.
-static bool render_view(nsfw_filter *f, gs_texture_t *full, const ViewRect &r)
+// Dessine une vue dans small_tr (carré de `side` px). La zone à lire est choisie par la
+// projection (gs_ortho) : elle est mise à l'échelle du viewport.
+//  - letterbox faux : la zone est étirée pour remplir tout le carré ;
+//  - letterbox vrai : la zone est collée en haut à gauche, sans déformation, à l'échelle
+//    max(w, h) / side ; le reste du carré est noir (comme le fait NudeNet).
+static bool render_view(nsfw_filter *f, gs_texture_t *full, const ViewRect &r, int side, bool letterbox)
 {
-	constexpr uint32_t sz = kInputSize;
-	const int level = pyramid_level_for(r);
+	const uint32_t sz = static_cast<uint32_t>(side);
+	const int level = pyramid_level_for(r, side, letterbox);
 	gs_texture_t *src = pyramid_texture(f, full, level);
 	if (!src)
 		return false;
@@ -874,8 +1223,10 @@ static bool render_view(nsfw_filter *f, gs_texture_t *full, const ViewRect &r)
 	const uint32_t lh = std::max<uint32_t>(1, f->h >> level);
 	const float sx = static_cast<float>(lw) / static_cast<float>(f->w);
 	const float sy = static_cast<float>(lh) / static_cast<float>(f->h);
+	const float ext_w = letterbox ? std::max(r.w, r.h) : r.w;
+	const float ext_h = letterbox ? std::max(r.w, r.h) : r.h;
 	const float x0 = r.x * sx, y0 = r.y * sy;
-	const float x1 = x0 + r.w * sx, y1 = y0 + r.h * sy;
+	const float x1 = x0 + ext_w * sx, y1 = y0 + ext_h * sy;
 
 	gs_texrender_reset(f->small_tr);
 	if (!gs_texrender_begin(f->small_tr, sz, sz))
@@ -902,13 +1253,27 @@ static bool render_view(nsfw_filter *f, gs_texture_t *full, const ViewRect &r)
 // et les soumet au worker.
 static void analyze(nsfw_filter *f, gs_texture_t *full)
 {
-	constexpr uint32_t sz = kInputSize;
 	const ViewPlan plan = plan_views(f);
+	const uint32_t sz = static_cast<uint32_t>(plan.side);
+
+	// Changement de taille de vue (autre moteur) : les surfaces de rapatriement sont
+	// à refaire, et celles en attente ne correspondent plus.
+	if (f->surf_side != plan.side) {
+		for (auto &set : f->stage) {
+			for (auto *&s : set) {
+				if (s)
+					gs_stagesurface_destroy(s);
+				s = nullptr;
+			}
+		}
+		f->stage_valid[0] = f->stage_valid[1] = false;
+		f->surf_side = plan.side;
+	}
 
 	// Niveau de pyramide le plus profond dont une vue a besoin.
 	int max_level = 0;
 	for (int v = 0; v < plan.count; v++)
-		max_level = std::max(max_level, pyramid_level_for(plan.rect[v]));
+		max_level = std::max(max_level, pyramid_level_for(plan.rect[v], plan.side, plan.letterbox));
 	build_pyramid(f, full, max_level);
 
 	const int cur = f->stage_idx;
@@ -916,15 +1281,18 @@ static void analyze(nsfw_filter *f, gs_texture_t *full)
 
 	int staged = 0;
 	for (int v = 0; v < plan.count; v++) {
-		if (!render_view(f, full, plan.rect[v]))
+		if (!render_view(f, full, plan.rect[v], plan.side, plan.letterbox))
 			break;
 		if (!f->stage[cur][v])
 			f->stage[cur][v] = gs_stagesurface_create(sz, sz, GS_RGBA);
 		gs_stage_texture(f->stage[cur][v], gs_texrender_get_texture(f->small_tr));
+		f->stage_rect[cur][v] = plan.rect[v];
 		staged++;
 	}
 	f->stage_valid[cur] = staged > 0;
 	f->stage_views[cur] = staged;
+	f->stage_side[cur] = plan.side;
+	f->stage_engine[cur] = plan.engine;
 	f->stage_frame[cur] = f->frame_id;
 	// La zone n'est utilisable que si sa vue a bien été préparée.
 	f->stage_zone_view[cur] = plan.zone_view >= 0 && plan.zone_view < staged ? plan.zone_view : -1;
@@ -932,25 +1300,34 @@ static void analyze(nsfw_filter *f, gs_texture_t *full)
 	f->stage_zone_y[cur] = plan.zone_view >= 0 ? plan.rect[plan.zone_view].y : 0.0f;
 
 	if (f->stage_valid[prev]) {
+		const int pviews = f->stage_views[prev];
+		const size_t pplane = static_cast<size_t>(f->stage_side[prev]) * f->stage_side[prev] * 4;
+		if (f->map_buf.size() < pplane * static_cast<size_t>(pviews))
+			f->map_buf.resize(pplane * static_cast<size_t>(pviews));
+
 		int copied = 0;
-		for (int v = 0; v < f->stage_views[prev]; v++) {
+		for (int v = 0; v < pviews; v++) {
 			uint8_t *data = nullptr;
 			uint32_t linesize = 0;
 			if (!f->stage[prev][v] || !gs_stagesurface_map(f->stage[prev][v], &data, &linesize))
 				break;
-			uint8_t *dst = f->map_buf.data() + static_cast<size_t>(v) * kPlaneBytes;
-			for (uint32_t y = 0; y < sz; y++)
-				std::memcpy(dst + static_cast<size_t>(y) * sz * 4,
-					    data + static_cast<size_t>(y) * linesize, sz * 4);
+			const uint32_t psz = static_cast<uint32_t>(f->stage_side[prev]);
+			uint8_t *dst = f->map_buf.data() + static_cast<size_t>(v) * pplane;
+			for (uint32_t y = 0; y < psz; y++)
+				std::memcpy(dst + static_cast<size_t>(y) * psz * 4,
+					    data + static_cast<size_t>(y) * linesize, static_cast<size_t>(psz) * 4);
 			gs_stagesurface_unmap(f->stage[prev][v]);
 			copied++;
 		}
 
-		if (copied == f->stage_views[prev] && copied > 0) {
+		if (copied == pviews && copied > 0) {
 			{
 				std::lock_guard<std::mutex> lk(f->job_m);
 				f->job_buf.swap(f->map_buf);
 				f->job_views = copied;
+				f->job_engine = f->stage_engine[prev];
+				f->job_side = f->stage_side[prev];
+				std::copy(f->stage_rect[prev], f->stage_rect[prev] + copied, f->job_rect);
 				f->job_zone_view = f->stage_zone_view[prev];
 				f->job_zone_x = f->stage_zone_x[prev];
 				f->job_zone_y = f->stage_zone_y[prev];
@@ -1080,6 +1457,78 @@ static void draw_mask(nsfw_filter *f, gs_texture_t *tex)
 		gs_draw_sprite(nullptr, 0, f->w, f->h);
 }
 
+// Dessine le rectangle (x, y, w, h) de la source, en pixels, avec les coordonnées de
+// texture correspondantes (la texture couvre toute la source : fw x fh pixels).
+static void draw_quad(float x, float y, float w, float h, float fw, float fh)
+{
+	const float u0 = x / fw, v0 = y / fh, u1 = (x + w) / fw, v1 = (y + h) / fh;
+	gs_render_start(true);
+	gs_texcoord(u0, v0, 0);
+	gs_vertex2f(x, y);
+	gs_texcoord(u1, v0, 0);
+	gs_vertex2f(x + w, y);
+	gs_texcoord(u0, v1, 0);
+	gs_vertex2f(x, y + h);
+	gs_texcoord(u1, v1, 0);
+	gs_vertex2f(x + w, y + h);
+	gs_render_stop(GS_TRISTRIP);
+}
+
+// Mode localisé : dessine par-dessus l'image déjà affichée le masque (noir, pixelisation
+// ou flou) uniquement dans les zones détectées.
+static void draw_regions(nsfw_filter *f, gs_texture_t *tex)
+{
+	std::vector<const Region *> active;
+	for (const Region &r : f->regions)
+		if (f->display_id >= 0 && static_cast<uint64_t>(f->display_id) >= r.start_id)
+			active.push_back(&r);
+	if (active.empty())
+		return;
+
+	const float fw = static_cast<float>(f->w), fh = static_cast<float>(f->h);
+
+	if (f->mode == MASK_BLUR && f->blur_fx) {
+		render_blur_passes(f, tex);
+		gs_texture_t *horiz = gs_texrender_get_texture(f->blur_tr[1]);
+		if (horiz) {
+			vec2 texel;
+			vec2_set(&texel, 0.0f, 1.0f / static_cast<float>(f->blur_h));
+			gs_effect_set_texture(gs_effect_get_param_by_name(f->blur_fx, "image"), horiz);
+			gs_effect_set_vec2(gs_effect_get_param_by_name(f->blur_fx, "texel"), &texel);
+			gs_effect_set_float(gs_effect_get_param_by_name(f->blur_fx, "sigma"), f->blur_sigma);
+			while (gs_effect_loop(f->blur_fx, "Draw"))
+				for (const Region *r : active)
+					draw_quad(r->x, r->y, r->w, r->h, fw, fh);
+			return;
+		}
+	}
+
+	if (f->mode == MASK_PIXELATE && f->pixel_fx) {
+		const float px = static_cast<float>(std::max(1, f->pixel_size.load()));
+		vec2 b;
+		vec2_set(&b, std::max(1.0f, fw / px), std::max(1.0f, fh / px));
+		gs_effect_set_texture(gs_effect_get_param_by_name(f->pixel_fx, "image"), tex);
+		gs_effect_set_vec2(gs_effect_get_param_by_name(f->pixel_fx, "blocks"), &b);
+		while (gs_effect_loop(f->pixel_fx, "Draw"))
+			for (const Region *r : active)
+				draw_quad(r->x, r->y, r->w, r->h, fw, fh);
+		return;
+	}
+
+	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+	vec4 black;
+	vec4_set(&black, 0.0f, 0.0f, 0.0f, 1.0f);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(solid, "color"), &black);
+	for (const Region *r : active) {
+		gs_matrix_push();
+		gs_matrix_translate3f(r->x, r->y, 0.0f);
+		while (gs_effect_loop(solid, "Solid"))
+			gs_draw_sprite(nullptr, 0, static_cast<uint32_t>(std::ceil(r->w)),
+				       static_cast<uint32_t>(std::ceil(r->h)));
+		gs_matrix_pop();
+	}
+}
+
 static void filter_render(void *data, gs_effect_t *)
 {
 	auto *f = static_cast<nsfw_filter *>(data);
@@ -1109,6 +1558,18 @@ static void filter_render(void *data, gs_effect_t *)
 			f->mask_active = false;
 			f->streak = 0;
 			blog(LOG_INFO, LOG_PREFIX "masque levé");
+		}
+
+		// Zones masquées : on garde chacune tant qu'elle a été confirmée récemment.
+		if (!f->regions.empty()) {
+			const uint64_t hold = static_cast<uint64_t>(f->hold_ms.load()) * 1000000ULL;
+			f->regions.erase(std::remove_if(f->regions.begin(), f->regions.end(),
+							[&](const Region &r) { return now - r.last_ns > hold; }),
+					 f->regions.end());
+			if (f->regions.empty()) {
+				f->streak = 0;
+				blog(LOG_INFO, LOG_PREFIX "zones masquées levées");
+			}
 		}
 
 		f->cur_delay = compute_delay(f);
@@ -1149,6 +1610,8 @@ static void filter_render(void *data, gs_effect_t *)
 	gs_effect_set_texture(gs_effect_get_param_by_name(eff, "image"), tex);
 	while (gs_effect_loop(eff, "Draw"))
 		gs_draw_sprite(tex, 0, f->w, f->h);
+
+	draw_regions(f, tex);
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ add_library(obs-nsfw-guard MODULE
   src/plugin-main.cpp
   src/nsfw-filter.cpp
   src/classifier.cpp
+  src/detector.cpp
 )
 
 target_include_directories(obs-nsfw-guard PRIVATE
