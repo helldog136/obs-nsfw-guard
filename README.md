@@ -26,6 +26,8 @@ Radeon RX 6900 XT). C'est une mesure sur une machine, pas une garantie.
 3. Relancez OBS, puis : clic droit sur une source → **Filtres** → **+** → **NSFW Guard**.
 
 Désinstallation : « Applications installées » de Windows (ou `unins000.exe` dans le dossier du plugin).
+Les modèles NudeNet éventuellement téléchargés restent dans
+`%APPDATA%\obs-studio\plugin_config\obs-nsfw-guard\models` : supprimez ce dossier pour les retirer.
 
 Installation manuelle : extrayez plutôt `obs-nsfw-guard-*-windows-x64.zip` dans
 `C:\ProgramData\obs-studio\plugins` (le dossier `obs-nsfw-guard` doit se retrouver dedans).
@@ -42,6 +44,8 @@ L'installeur n'est pas signé : Windows SmartScreen peut afficher un avertisseme
 | Maintenir le masque | Durée du masque après la dernière détection. |
 | Style du masque | Noir, pixelisé (taille de bloc réglable) ou flou gaussien (intensité réglable). |
 | Retarder l'image | Tampon qui laisse le temps à l'analyse. Automatique ou en nombre d'images. |
+| Moteur d'analyse | Classifieur MobileNet (défaut, livré avec le plugin) ou détecteur NudeNet 320n / 640m (optionnel, à télécharger). Voir « Détecteur NudeNet ». |
+| Parties du corps, confiance, zone détectée, marge | Réglages du détecteur NudeNet : classes qui déclenchent le masque, confiance minimale, masquer seulement la zone détectée, marge autour de la zone. |
 | Méthode d'analyse | Ce qui est envoyé au modèle : image entière réduite, zone aléatoire, mixte ou grille de zones. Voir ci-dessous. |
 | Taille de la zone aléatoire | Côté (en pixels de la source) de la zone analysée en mode « zone aléatoire » ou « mixte ». |
 | Analyser une image sur | Fréquence d'analyse (1 = chaque image). |
@@ -66,6 +70,37 @@ le délai automatique** de l'image ; le filtre l'affiche dans les réglages. Act
 temps » pour voir le temps d'analyse réel sur votre machine. Une zone aléatoire trouve un élément en
 quelques passages (le temps d'un tour complet de l'écran), pas instantanément.
 
+## Détecteur NudeNet (optionnel) : masquer seulement la zone concernée
+
+Le classifieur par défaut juge l'image entière : il ne peut que masquer toute la source. Le moteur **NudeNet**
+est un détecteur d'objets qui renvoie la **position** des parties du corps repérées : le filtre peut alors flouter,
+pixeliser ou noircir uniquement la zone détectée (avec une marge réglable), le reste de la source restant visible.
+
+**Les modèles NudeNet ne sont pas fournis avec le plugin.** NudeNet est un projet tiers
+([notAI-tech/NudeNet](https://github.com/notAI-tech/NudeNet), code sous licence AGPL-3.0 ; son dépôt ne précise pas
+la licence des fichiers de modèle). Consultez-la et respectez-la pour votre usage. NSFW Guard n'est pas affilié à
+NudeNet. Pour les utiliser :
+
+1. Dans les réglages du filtre, choisissez le moteur **NudeNet 320n** (rapide) ou **640m** (plus précis).
+2. Dans le groupe **Modèles NudeNet**, au choix :
+   - **Téléchargement direct** : cochez la case d'acceptation de la licence, puis « Télécharger NudeNet 320n ».
+     Le fichier vient directement de la release officielle de NudeNet ; sa taille et son empreinte SHA-256 sont
+     vérifiées. Cliquez sur « Actualiser l'état » pour suivre la progression.
+   - **Manuellement** : « Ouvrir la page de téléchargement de NudeNet », téléchargez `320n.onnx` (ou `640m.onnx`),
+     puis « Importer un modèle téléchargé » et choisissez ce fichier. GitHub peut demander de se connecter.
+3. Les fichiers sont rangés dans `%APPDATA%\obs-studio\plugin_config\obs-nsfw-guard\models` (« Ouvrir le dossier
+   des modèles »). Tant qu'un modèle n'est pas installé, le filtre se rabat sur le classifieur MobileNet et
+   l'indique dans le journal d'OBS.
+
+Les classes qui déclenchent le masque sont réglables ; par défaut, seul le contenu explicite (poitrine féminine,
+fesses, organes génitaux et anus exposés) est coché. La « confiance minimale » (40 % par défaut) est une valeur
+de départ à ajuster avec le journal de débogage, qui liste chaque détection et son score.
+
+**Ressources** : le 320n prend environ 9 ms par analyse sur CPU (Ryzen 7 5800X). Le 640m prend environ 220 ms sur
+CPU, trop lent pour suivre la vidéo, et n'est utilisable qu'avec le GPU (DirectML) ; or un blocage complet d'un
+PC a été observé une fois juste après le chargement du 640m sur DirectML (cause non établie, ce PC ayant déjà des
+blocages sans ce plugin). Préférez le 320n sur CPU.
+
 ## Limites
 
 - **Ce n'est pas une garantie.** Un classifieur fait des faux positifs et des faux négatifs. Ne comptez pas
@@ -77,6 +112,10 @@ quelques passages (le temps d'un tour complet de l'écran), pas instantanément.
   désactivée.
 - Windows 64 bits uniquement pour l'instant. Développé et testé avec OBS 32.2.2.
 - Sources semi-transparentes : la composition alpha n'est pas gérée avec précision.
+- Mode « zone détectée » : le cadre suit le contenu au rythme des analyses ; un mouvement rapide peut le
+  décaler d'une analyse (la marge sert à compenser). Seules les classes cochées déclenchent le masque.
+- Le téléchargement automatique passe par l'API GitHub, limitée à 60 requêtes par heure et par adresse IP ;
+  la voie manuelle (page de téléchargement puis import) reste possible si elle échoue.
 
 ## Compilation
 
@@ -121,3 +160,10 @@ worker thread (about 1.3 ms/frame on a Ryzen 7 5800X CPU) and everything stays l
 Windows x64 only, developed against OBS 32.2.2. Run the `-setup.exe` from the latest release (or unzip the
 zip into `C:\ProgramData\obs-studio\plugins`), restart OBS, and add **NSFW Guard** from a source's Filters dialog. It is not a guarantee: classifiers make
 mistakes. Licensed GPL-2.0-or-later.
+
+**Optional NudeNet detector** (masks only the detected area instead of the whole source): the NudeNet model
+files are a third-party project and are **not** distributed with this plugin. You download them yourself from
+NudeNet's official release (button in the filter, after accepting their licence, or import a file you
+downloaded; SHA-256 is verified). NudeNet's code is AGPL-3.0 and its repository does not state the licence of
+the model files: check it for your use. This plugin is not affiliated with NudeNet. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

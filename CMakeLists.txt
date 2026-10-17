@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(obs-nsfw-guard VERSION 0.2.0 LANGUAGES C CXX)
+project(obs-nsfw-guard VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +13,7 @@ add_library(obs-nsfw-guard MODULE
   src/nsfw-filter.cpp
   src/classifier.cpp
   src/detector.cpp
+  src/model-download.cpp
 )
 
 target_include_directories(obs-nsfw-guard PRIVATE
@@ -23,7 +24,7 @@ target_include_directories(obs-nsfw-guard PRIVATE
 )
 
 # obs.lib est générée depuis l'obs.dll installé (voir deps/obs.def).
-target_link_libraries(obs-nsfw-guard PRIVATE ${DEPS}/obs.lib)
+target_link_libraries(obs-nsfw-guard PRIVATE ${DEPS}/obs.lib winhttp bcrypt shell32)
 
 target_compile_definitions(obs-nsfw-guard PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(obs-nsfw-guard PRIVATE /utf-8 /W3 /Zc:__cplusplus /Zc:preprocessor)

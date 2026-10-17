@@ -24,14 +24,21 @@
 #include <utility>
 #include <vector>
 
+#include <windows.h>
+#include <shellapi.h>
+
 #include "classifier.h"
 #include "detector.h"
+#include "model-download.h"
 #include "nsfw-filter.h"
 
 #define FILTER_ID "nsfw_guard_filter"
 #define LOG_PREFIX "[nsfw-guard] "
 
 // --- clés de réglage -------------------------------------------------------
+#ifdef S_THRESHOLD
+#undef S_THRESHOLD // définie par un en-tête Windows
+#endif
 #define S_THRESHOLD "threshold"       // % : score à partir duquel une image est jugée sensible
 #define S_SEXY_WEIGHT "sexy_weight"   // % : poids de la classe "sexy" dans le score
 #define S_CONSECUTIVE "consecutive"   // nb d'analyses positives consécutives avant de masquer
@@ -49,6 +56,13 @@
 #define S_LOCALIZED "localized"       // ne masquer que la zone détectée (moteurs NudeNet)
 #define S_REGION_MARGIN "region_margin" // % : marge ajoutée autour d'une zone détectée
 #define S_CLASSES_GROUP "classes_group"
+#define S_MODELS_GROUP "models_group"
+#define S_MODELS_STATUS "models_status" // texte d'état affiché (réécrit à chaque ouverture des réglages)
+#define S_DL_ACCEPT "dl_accept"       // l'utilisateur a lu la licence et accepte le téléchargement
+#define S_IMPORT_PATH "import_path"   // fichier modèle fourni par l'utilisateur
+
+// Page officielle où l'utilisateur peut télécharger lui-même les modèles.
+#define NUDENET_RELEASE_URL L"https://github.com/notAI-tech/NudeNet/releases/tag/v3.4-weights"
 #define S_CLASS_PREFIX "cls_"         // cls_0 .. cls_17 : classes NudeNet qui déclenchent le masque
 
 // Moteur d'analyse. Valeurs stockées dans les réglages : ne pas renuméroter.
@@ -232,6 +246,8 @@ struct nsfw_filter {
 	std::atomic<float> region_margin{0.25f};
 	std::atomic<uint32_t> class_mask{0}; // bit i = la classe NudeNet i déclenche le masque
 	std::atomic<bool> det_failed{false}; // détecteur indisponible : repli sur le classifieur
+	std::atomic<bool> dl_accept{false};
+	uint32_t seen_gen = 0; // dernière génération de modèles installés prise en compte
 	std::atomic<bool> delay_on{true};
 	std::atomic<bool> auto_delay{true};
 	std::atomic<int> delay_frames{3};
@@ -436,7 +452,7 @@ static void worker_main(nsfw_filter *f)
 				const char *name = engine == ENGINE_NUDENET_320N ? "NudeNet 320n" : "NudeNet 640m";
 				if (det_path.empty()) {
 					blog(LOG_ERROR,
-					     LOG_PREFIX "%s : fichier modèle introuvable dans les données du plugin ; repli sur le classifieur MobileNet",
+					     LOG_PREFIX "%s : modèle non installé (réglages du filtre > Modèles NudeNet) ; repli sur le classifieur MobileNet",
 					     name);
 					f->det_failed = true;
 					continue;
@@ -531,20 +547,65 @@ static std::wstring module_file_wide(const char *name)
 	return result;
 }
 
-static void filter_update(void *data, obs_data_t *s)
+static std::wstring widen_ascii(const char *s)
 {
-	auto *f = static_cast<nsfw_filter *>(data);
+	return std::wstring(s, s + std::strlen(s));
+}
 
-	// Les modèles NudeNet ne sont pas livrés avec le plugin : on les cherche à chaque
-	// mise à jour, pour qu'un fichier ajouté après coup soit pris en compte.
+// Dossier des modèles NudeNet téléchargés ou importés par l'utilisateur : dans son profil
+// OBS (plugin_config), donc sans droits d'administrateur. Il est créé si `create`.
+static std::wstring models_dir_wide(bool create)
+{
+	std::wstring result;
+	char *path = obs_module_config_path("models");
+	if (!path)
+		return result;
+	if (create)
+		os_mkdirs(path);
+	wchar_t *wide = nullptr;
+	os_utf8_to_wcs_ptr(path, 0, &wide);
+	if (wide) {
+		result = wide;
+		bfree(wide);
+	}
+	bfree(path);
+	return result;
+}
+
+// Emplacement du modèle `index` : dossier de l'utilisateur d'abord, puis données du
+// plugin (installation manuelle). Vide s'il est introuvable.
+static std::wstring find_det_model(int index)
+{
+	const ModelInfo &mi = model_info(index);
+	const std::wstring dir = models_dir_wide(false);
+	if (!dir.empty()) {
+		const std::wstring p = dir + L"/" + widen_ascii(mi.file);
+		if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
+			return p;
+	}
+	return module_file_wide(mi.file);
+}
+
+// Les modèles NudeNet ne sont pas livrés avec le plugin : on relit leur emplacement à
+// chaque mise à jour et dès qu'un modèle vient d'être installé, sans redémarrer OBS.
+static void refresh_det_paths(nsfw_filter *f)
+{
+	const std::wstring p320 = find_det_model(0);
+	const std::wstring p640 = find_det_model(1);
 	{
-		const std::wstring p320 = module_file_wide("nudenet_320n.onnx");
-		const std::wstring p640 = module_file_wide("nudenet_640m.onnx");
 		std::lock_guard<std::mutex> lk(f->job_m);
 		f->det_path[0] = p320;
 		f->det_path[1] = p640;
 	}
 	f->det_failed = false;
+}
+
+static void filter_update(void *data, obs_data_t *s)
+{
+	auto *f = static_cast<nsfw_filter *>(data);
+
+	refresh_det_paths(f);
+	f->dl_accept = obs_data_get_bool(s, S_DL_ACCEPT);
 
 	f->engine = std::clamp(static_cast<int>(obs_data_get_int(s, S_ENGINE)), 0, static_cast<int>(ENGINE_NUDENET_640M));
 	f->det_threshold = static_cast<float>(obs_data_get_int(s, S_DET_THRESHOLD)) / 100.0f;
@@ -654,6 +715,117 @@ static bool mode_toggled(obs_properties_t *props, obs_property_t *, obs_data_t *
 	return true;
 }
 
+// Résultat du dernier import de fichier : -2 aucun, -1 refusé, sinon index du modèle.
+static std::atomic<int> g_last_import{-2};
+
+// Texte d'état affiché dans le groupe « Modèles NudeNet ».
+static std::string models_status_text()
+{
+	std::string t;
+	for (int i = 0; i < kModelCount; i++) {
+		if (!t.empty())
+			t += "\n";
+		t += std::string(model_info(i).label) + " : ";
+		t += obs_module_text(find_det_model(i).empty() ? "Models.NotInstalled" : "Models.Installed");
+	}
+
+	const DlStatus st = download_status();
+	if (st.state == DlState::Downloading && st.model >= 0) {
+		const int pct = st.total ? static_cast<int>(st.done * 100 / st.total) : 0;
+		t += "\n" + std::string(model_info(st.model).label) + " : " + obs_module_text("Dl.Progress") + " " +
+		     std::to_string(pct) + " %";
+	} else if (st.state == DlState::Error && st.model >= 0) {
+		t += "\n" + std::string(model_info(st.model).label) + " : " +
+		     obs_module_text(("Dl.Err." + std::to_string(static_cast<int>(st.error))).c_str());
+		if (st.error == DlError::HttpStatus)
+			t += " (" + std::to_string(st.http_status) + ")";
+	} else if (st.state == DlState::Done && st.model >= 0) {
+		t += "\n" + std::string(model_info(st.model).label) + " : " + obs_module_text("Dl.Done");
+	}
+
+	const int imp = g_last_import.load();
+	if (imp >= 0)
+		t += "\n" + std::string(obs_module_text("Dl.ImportOk")) + " " + model_info(imp).label;
+	else if (imp == -1)
+		t += "\n" + std::string(obs_module_text("Dl.ImportFail"));
+	return t;
+}
+
+static bool start_download(void *priv, int index)
+{
+	auto *f = static_cast<nsfw_filter *>(priv);
+	if (!f->dl_accept.load())
+		return false;
+	if (!start_model_download(index, models_dir_wide(true)))
+		blog(LOG_WARNING, LOG_PREFIX "téléchargement non démarré (déjà en cours ?)");
+	else
+		blog(LOG_INFO, LOG_PREFIX "téléchargement de %s depuis le dépôt NudeNet", model_info(index).label);
+	return true; // réaffiche les réglages avec l'état à jour
+}
+
+static bool download_320n_clicked(obs_properties_t *, obs_property_t *, void *priv)
+{
+	return start_download(priv, 0);
+}
+
+static bool download_640m_clicked(obs_properties_t *, obs_property_t *, void *priv)
+{
+	return start_download(priv, 1);
+}
+
+static bool refresh_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	return true; // le réaffichage recalcule le texte d'état
+}
+
+static bool open_page_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	ShellExecuteW(nullptr, L"open", NUDENET_RELEASE_URL, nullptr, nullptr, SW_SHOWNORMAL);
+	return false;
+}
+
+static bool open_dir_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	const std::wstring dir = models_dir_wide(true);
+	if (!dir.empty())
+		ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	return false;
+}
+
+// Un fichier a été choisi : on vérifie qu'il s'agit bien d'un modèle NudeNet attendu
+// (taille et empreinte SHA-256) avant de le copier dans le dossier des modèles.
+static bool import_selected(obs_properties_t *, obs_property_t *, obs_data_t *s)
+{
+	const char *path = obs_data_get_string(s, S_IMPORT_PATH);
+	if (!path || !*path)
+		return false;
+
+	wchar_t *wide = nullptr;
+	os_utf8_to_wcs_ptr(path, 0, &wide);
+	int index = -1;
+	if (wide) {
+		index = import_model_file(wide, models_dir_wide(true));
+		bfree(wide);
+	}
+	g_last_import = index;
+	if (index >= 0)
+		blog(LOG_INFO, LOG_PREFIX "%s importé", model_info(index).label);
+	else
+		blog(LOG_WARNING, LOG_PREFIX "fichier refusé : ce n'est pas un modèle NudeNet attendu (%s)", path);
+
+	obs_data_set_string(s, S_IMPORT_PATH, ""); // permet de rechoisir le même fichier
+	return true;
+}
+
+// Les boutons de téléchargement ne sont proposés qu'une fois la licence acceptée.
+static bool accept_toggled(obs_properties_t *props, obs_property_t *, obs_data_t *s)
+{
+	const bool ok = obs_data_get_bool(s, S_DL_ACCEPT);
+	obs_property_set_visible(obs_properties_get(props, "dl_320n"), ok);
+	obs_property_set_visible(obs_properties_get(props, "dl_640m"), ok);
+	return true;
+}
+
 // Affiche ou masque les réglages selon le moteur (classifieur ou détecteur NudeNet).
 static bool engine_toggled(obs_properties_t *props, obs_property_t *, obs_data_t *s)
 {
@@ -663,6 +835,7 @@ static bool engine_toggled(obs_properties_t *props, obs_property_t *, obs_data_t
 	obs_property_set_visible(obs_properties_get(props, S_SEXY_WEIGHT), !det);
 	obs_property_set_visible(obs_properties_get(props, S_DET_THRESHOLD), det);
 	obs_property_set_visible(obs_properties_get(props, S_CLASSES_GROUP), det);
+	obs_property_set_visible(obs_properties_get(props, S_MODELS_GROUP), det);
 	obs_property_set_visible(obs_properties_get(props, S_LOCALIZED), det);
 	obs_property_set_visible(obs_properties_get(props, S_REGION_MARGIN),
 				 det && obs_data_get_bool(s, S_LOCALIZED));
@@ -692,9 +865,17 @@ static bool delay_toggled(obs_properties_t *props, obs_property_t *, obs_data_t 
 	return true;
 }
 
-static obs_properties_t *filter_properties(void *)
+static obs_properties_t *filter_properties(void *data)
 {
+	auto *f = static_cast<nsfw_filter *>(data);
 	obs_properties_t *p = obs_properties_create();
+
+	// Le texte d'un champ d'information est la valeur du réglage : on y écrit l'état à jour.
+	if (f && f->self) {
+		obs_data_t *st = obs_source_get_settings(f->self);
+		obs_data_set_string(st, S_MODELS_STATUS, models_status_text().c_str());
+		obs_data_release(st);
+	}
 
 	obs_property_t *prop = obs_properties_add_list(p, S_ENGINE, obs_module_text("Engine"), OBS_COMBO_TYPE_LIST,
 						       OBS_COMBO_FORMAT_INT);
@@ -716,6 +897,24 @@ static obs_properties_t *filter_properties(void *)
 
 	prop = obs_properties_add_int_slider(p, S_DET_THRESHOLD, obs_module_text("DetThreshold"), 15, 100, 1);
 	obs_property_set_long_description(prop, obs_module_text("DetThreshold.Desc"));
+
+	// Modèles NudeNet : optionnels, non distribués avec le plugin. Deux voies : téléchargement
+	// direct depuis le dépôt officiel (après acceptation), ou import d'un fichier téléchargé.
+	obs_properties_t *models = obs_properties_create();
+	obs_properties_add_text(models, S_MODELS_STATUS, obs_module_text("Models.StatusLabel"), OBS_TEXT_INFO);
+	prop = obs_properties_add_bool(models, S_DL_ACCEPT, obs_module_text("Dl.Accept"));
+	obs_property_set_long_description(prop, obs_module_text("Dl.Accept.Desc"));
+	obs_property_set_modified_callback(prop, accept_toggled);
+	obs_properties_add_button2(models, "dl_320n", obs_module_text("Dl.Button.320n"), download_320n_clicked, f);
+	obs_properties_add_button2(models, "dl_640m", obs_module_text("Dl.Button.640m"), download_640m_clicked, f);
+	obs_properties_add_button2(models, "dl_refresh", obs_module_text("Dl.Refresh"), refresh_clicked, f);
+	obs_properties_add_button2(models, "dl_open_page", obs_module_text("Dl.OpenPage"), open_page_clicked, f);
+	prop = obs_properties_add_path(models, S_IMPORT_PATH, obs_module_text("Dl.Import"), OBS_PATH_FILE,
+				       "NudeNet (*.onnx)", nullptr);
+	obs_property_set_long_description(prop, obs_module_text("Dl.Import.Desc"));
+	obs_property_set_modified_callback(prop, import_selected);
+	obs_properties_add_button2(models, "dl_open_dir", obs_module_text("Dl.OpenDir"), open_dir_clicked, f);
+	obs_properties_add_group(p, S_MODELS_GROUP, obs_module_text("Models"), OBS_GROUP_NORMAL, models);
 
 	obs_properties_t *classes = obs_properties_create();
 	for (int c = 0; c < kDetNumClasses; c++) {
@@ -788,6 +987,7 @@ static void filter_defaults(obs_data_t *s)
 {
 	obs_data_set_default_int(s, S_ENGINE, ENGINE_MOBILENET);
 	obs_data_set_default_string(s, S_ENGINE_WARNING, obs_module_text("Engine.Warning"));
+	obs_data_set_default_bool(s, S_DL_ACCEPT, false);
 	obs_data_set_default_int(s, S_DET_THRESHOLD, 40);
 	obs_data_set_default_bool(s, S_LOCALIZED, true);
 	obs_data_set_default_int(s, S_REGION_MARGIN, 25);
@@ -820,7 +1020,15 @@ static void filter_defaults(obs_data_t *s)
 
 static void filter_tick(void *data, float)
 {
-	static_cast<nsfw_filter *>(data)->new_tick = true;
+	auto *f = static_cast<nsfw_filter *>(data);
+	f->new_tick = true;
+
+	// Un modèle NudeNet vient d'être téléchargé ou importé : on le prend en compte tout de suite.
+	const uint32_t gen = models_generation();
+	if (gen != f->seen_gen) {
+		f->seen_gen = gen;
+		refresh_det_paths(f);
+	}
 }
 
 static float frame_ms()
