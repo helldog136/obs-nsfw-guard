@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include "model-download.h"
 #include "nsfw-filter.h"
 
 OBS_DECLARE_MODULE()
@@ -41,5 +42,6 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	model_download_shutdown();
 	blog(LOG_INFO, "[nsfw-guard] plugin déchargé");
 }

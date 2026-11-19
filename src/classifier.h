@@ -19,6 +19,10 @@ constexpr int kInputSize = 224;
 // de Windows pour l'option GPU.
 bool ClassifierGlobalInit(const std::wstring &dir, std::string &err);
 
+// Vrai si ClassifierGlobalInit a réussi. Tant que c'est faux, aucune classe utilisant
+// ONNX Runtime (Classifier, Detector) ne doit être construite : l'API n'est pas chargée.
+bool OrtAvailable();
+
 class Classifier {
 public:
 	// Lève std::exception en cas d'échec de chargement du modèle.
