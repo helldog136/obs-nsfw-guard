@@ -33,9 +33,21 @@ L'installeur trouve OBS installé normalement ou via Steam. Il installe dans
 version portable** (non prise en charge). Installation silencieuse (déploiement) :
 `obs-nsfw-guard-*-setup.exe /VERYSILENT /SUPPRESSMSGBOXES`.
 
-Désinstallation : « Applications installées » de Windows (ou `unins000.exe` dans le dossier du plugin).
-Les modèles NudeNet éventuellement téléchargés restent dans
-`%APPDATA%\obs-studio\plugin_config\obs-nsfw-guard\models` : supprimez ce dossier pour les retirer.
+### Mises à jour
+
+- **Automatiques (recommandé)** : le plugin regarde une fois par jour sur GitHub si une nouvelle version est
+  publiée (désactivable : réglages du filtre → **Mises à jour**). Si oui, la ligne d'état l'indique ; le bouton
+  « Télécharger la mise à jour » récupère l'installeur et vérifie son empreinte SHA-256. Il s'installe **à la
+  fermeture d'OBS** (Windows demande l'autorisation) : un stream n'est jamais interrompu.
+- **Manuelles** : lancez simplement l'installeur d'une version plus récente, par-dessus l'ancienne. Il indique
+  « Mise à jour de X vers Y », supprime les fichiers de l'ancienne version et conserve vos réglages et modèles.
+
+### Désinstallation
+
+« Paramètres Windows » → « Applications installées » → **NSFW Guard (plugin OBS)**, ou menu Démarrer →
+**NSFW Guard** → « Désinstaller NSFW Guard » (OBS doit être fermé). Le désinstalleur propose de supprimer aussi
+vos données (`%APPDATA%\obs-studio\plugin_config\obs-nsfw-guard` : modèles NudeNet téléchargés, préférences) ;
+les réglages des filtres, enregistrés dans vos scènes OBS, ne sont pas touchés.
 
 Installation manuelle : extrayez plutôt `obs-nsfw-guard-*-windows-x64.zip` dans
 `C:\ProgramData\obs-studio\plugins` (le dossier `obs-nsfw-guard` doit se retrouver dedans).
@@ -59,6 +71,7 @@ L'installeur n'est pas signé : Windows SmartScreen peut afficher un avertisseme
 | Analyser une image sur | Fréquence d'analyse (1 = chaque image). |
 | GPU (DirectML) | Utilise le GPU au lieu du CPU. Le CPU suffit et ne concurrence pas le jeu. À éviter en cas de doute : un blocage complet d'un PC a été observé une fois en testant le GPU avec un gros modèle, sans que la cause soit établie. |
 | Masquer tant que l'analyse IA ne fonctionne pas | La source reste masquée pendant le chargement du modèle, s'il ne peut pas être chargé, ou si l'analyse ne répond plus (plus de 3 s sans résultat). |
+| Mises à jour | Version installée, recherche automatique (une fois par jour, désactivable), téléchargement d'une nouvelle version installée à la fermeture d'OBS. |
 | Journaliser scores et temps | Écrit score, temps d'inférence, latence et délai dans le journal d'OBS pour calibrer le seuil. |
 
 ## Avant un live : recommandations
@@ -184,7 +197,7 @@ lands *before* the detected frame is shown, no separate Render Delay filter need
 worker thread (about 1.3 ms/frame on a Ryzen 7 5800X CPU) and everything stays local.
 
 Windows x64 only, OBS 30+ (developed against OBS 32.2.2; portable OBS not supported). Run the `-setup.exe` (no compilation needed; it also installs the Microsoft VC++ runtime if missing) from the latest release (or unzip the
-zip into `C:\ProgramData\obs-studio\plugins`), restart OBS, and add **NSFW Guard** from a source's Filters dialog. It is not a guarantee: classifiers make
+zip into `C:\ProgramData\obs-studio\plugins`), restart OBS, and add **NSFW Guard** from a source's Filters dialog. Updates: the plugin checks GitHub once a day (can be disabled), downloads the new installer on request (SHA-256 checked) and runs it when OBS closes; running a newer installer over an old one also updates in place. Uninstall from Windows "Installed apps" or the Start menu. It is not a guarantee: classifiers make
 mistakes. Licensed GPL-2.0-or-later.
 
 **Optional NudeNet detector** (masks only the detected area instead of the whole source): the NudeNet model
