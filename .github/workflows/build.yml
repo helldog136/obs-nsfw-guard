@@ -113,6 +113,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           name: obs-nsfw-guard-windows-x64
@@ -125,4 +127,4 @@ jobs:
           gh release create "${{ github.ref_name }}" dist/* \
             --repo "${{ github.repository }}" \
             --title "NSFW Guard ${{ github.ref_name }}" \
-            --generate-notes
+            --notes-file RELEASE_NOTES.md
