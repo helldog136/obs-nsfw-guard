@@ -1925,14 +1925,14 @@ static void filter_render(void *data, gs_effect_t *)
 		// Délai : en automatique, il augmente d'une image à la fois (une image répétée plutôt
 		// qu'un retour en arrière) et ne diminue qu'après kDelayDownNs de marge stable, pour
 		// limiter les saccades et garder un décalage audio constant.
-		const int target = compute_delay(f);
+		const int want_delay = compute_delay(f);
 		if (resumed || !f->delay_on.load() || !f->auto_delay.load()) {
-			f->cur_delay = target;
+			f->cur_delay = want_delay;
 			f->delay_down_ns = 0;
-		} else if (target > f->cur_delay) {
+		} else if (want_delay > f->cur_delay) {
 			f->cur_delay++;
 			f->delay_down_ns = 0;
-		} else if (target < f->cur_delay) {
+		} else if (want_delay < f->cur_delay) {
 			if (!f->delay_down_ns) {
 				f->delay_down_ns = now;
 			} else if (now - f->delay_down_ns > kDelayDownNs) {
