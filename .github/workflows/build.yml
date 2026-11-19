@@ -53,6 +53,23 @@ jobs:
       - name: Créer l'installeur
         run: ./scripts/installer.ps1
 
+      - name: Tester l'installeur (installation, fichiers, désinstallation)
+        run: |
+          $setup = Get-ChildItem dist/*-setup.exe | Select-Object -First 1
+          $dir = Join-Path $env:ProgramData 'obs-studio\plugins\obs-nsfw-guard'
+          $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$PWD\install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log; throw "installation : code $($p.ExitCode)" }
+          foreach ($f in 'bin\64bit\obs-nsfw-guard.dll', 'bin\64bit\onnxruntime.dll', 'data\nsfw_model.onnx', 'data\locale\en-US.ini', 'data\locale\fr-FR.ini', 'LICENSE') {
+            if (-not (Test-Path (Join-Path $dir $f))) { Get-Content install.log; throw "fichier absent après installation : $f" }
+          }
+          $unins = Get-ChildItem $dir -Filter 'unins*.exe' | Select-Object -First 1
+          if (-not $unins) { throw "désinstalleur absent" }
+          $p = Start-Process $unins.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "désinstallation : code $($p.ExitCode)" }
+          Start-Sleep -Seconds 3  # le désinstalleur se supprime lui-même juste après
+          if (Test-Path (Join-Path $dir 'bin\64bit\obs-nsfw-guard.dll')) { throw "le plugin est encore présent après désinstallation" }
+          Write-Host "Installeur OK"
+
       - name: Somme de contrôle
         run: |
           Get-ChildItem dist/* -Include *.zip, *.exe | ForEach-Object {
