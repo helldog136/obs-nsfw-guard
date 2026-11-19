@@ -38,6 +38,10 @@ struct DlStatus {
 // invalides.
 bool start_model_download(int index, const std::wstring &dest_dir);
 
+// Interrompt un téléchargement en cours et attend la fin de son thread. À appeler au
+// déchargement du plugin : le code du thread ne doit plus s'exécuter une fois le DLL libéré.
+void model_download_shutdown();
+
 // État du dernier téléchargement.
 DlStatus download_status();
 

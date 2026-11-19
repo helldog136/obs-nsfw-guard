@@ -2,6 +2,7 @@
 build/
 stage/
 dist/
+redist/
 
 # Dépendances téléchargées par scripts/fetch-deps.ps1
 deps/

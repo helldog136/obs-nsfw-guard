@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Publier la release v<version du CMakeLists> (crée le tag sur ce commit)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -53,6 +58,45 @@ jobs:
       - name: Créer l'installeur
         run: ./scripts/installer.ps1
 
+      - name: Tester l'installeur (installation, mise à jour, désinstallation)
+        run: |
+          $setup = (Get-ChildItem dist/*-setup.exe | Select-Object -First 1).FullName
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(obs-nsfw-guard VERSION ([\d.]+)').Matches[0].Groups[1].Value
+          $dir = Join-Path $env:ProgramData 'obs-studio\plugins\obs-nsfw-guard'
+          $key = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B0F3B1A-7C52-4E0B-9A0D-2E3F5A9C41D7}_is1'
+          $menu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\NSFW Guard'
+          function Run-Setup($exe, $extra, $log) {
+            $p = Start-Process $exe -ArgumentList (@('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$PWD\$log") + $extra) -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue; throw "$exe : code $($p.ExitCode)" }
+          }
+          function Check-Installed {
+            foreach ($f in 'bin\64bit\obs-nsfw-guard.dll', 'bin\64bit\onnxruntime.dll', 'data\nsfw_model.onnx', 'data\locale\en-US.ini', 'data\locale\fr-FR.ini', 'LICENSE') {
+              if (-not (Test-Path (Join-Path $dir $f))) { throw "fichier absent après installation : $f" }
+            }
+            $v = (Get-ItemProperty $key).DisplayVersion
+            if ($v -ne $version) { throw "version enregistrée : $v (attendu $version)" }
+            if (-not (Get-ChildItem $menu -Filter *.lnk)) { throw "raccourci du désinstalleur absent" }
+          }
+
+          # 1) Installation
+          Run-Setup $setup @() 'install.log'
+          Check-Installed
+          # 2) Mise à jour par-dessus (comme le plugin la lance : /WAITOBS) ; un fichier obsolète doit disparaître
+          Set-Content (Join-Path $dir 'bin\64bit\obsolete.dll') 'x'
+          Run-Setup $setup @('/WAITOBS') 'update.log'
+          Check-Installed
+          if (Test-Path (Join-Path $dir 'bin\64bit\obsolete.dll')) { throw "fichier obsolète conservé par la mise à jour" }
+          if (-not (Select-String -Path update.log -Pattern 'Version install' -Quiet)) { throw "version précédente non détectée" }
+          if ((Get-ChildItem $dir -Filter 'unins*.exe').Count -ne 1) { throw "plusieurs désinstalleurs" }
+          # 3) Désinstallation
+          $unins = (Get-ChildItem $dir -Filter 'unins*.exe' | Select-Object -First 1).FullName
+          Run-Setup $unins @() 'uninstall.log'
+          Start-Sleep -Seconds 3  # le désinstalleur se supprime lui-même juste après
+          if (Test-Path (Join-Path $dir 'bin')) { throw "le plugin est encore présent après désinstallation" }
+          if (Test-Path $key) { throw "entrée « Applications installées » restante" }
+          if (Test-Path $menu) { throw "raccourcis du menu Démarrer restants" }
+          Write-Host "Installeur OK : installation, mise à jour et désinstallation"
+
       - name: Somme de contrôle
         run: |
           Get-ChildItem dist/* -Include *.zip, *.exe | ForEach-Object {
@@ -69,11 +113,13 @@ jobs:
   release:
     name: Publier la release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           name: obs-nsfw-guard-windows-x64
@@ -83,7 +129,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
+          # Tag poussé : on l'utilise. Lancement manuel : v<version du CMakeLists>, créé sur ce commit.
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="v$(sed -nE 's/^project\(obs-nsfw-guard VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)"
+            if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "La release $tag existe déjà" >&2; exit 1
+            fi
+          fi
+          gh release create "$tag" dist/* \
             --repo "${{ github.repository }}" \
-            --title "NSFW Guard ${{ github.ref_name }}" \
-            --generate-notes
+            --target "${{ github.sha }}" \
+            --title "NSFW Guard $tag" \
+            --notes-file RELEASE_NOTES.md

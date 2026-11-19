@@ -31,6 +31,7 @@
 #include "detector.h"
 #include "model-download.h"
 #include "nsfw-filter.h"
+#include "updater.h"
 
 #define FILTER_ID "nsfw_guard_filter"
 #define LOG_PREFIX "[nsfw-guard] "
@@ -71,6 +72,8 @@ enum Engine {
 	ENGINE_NUDENET_320N = 1, // détecteur NudeNet 320n (petit, rapide)
 	ENGINE_NUDENET_640M = 2, // détecteur NudeNet 640m (précis, plus lourd)
 };
+
+static float frame_ms();
 
 static int engine_side(int engine)
 {
@@ -126,6 +129,33 @@ struct Region {
 #define S_USE_DML "use_dml"           // GPU (DirectML) au lieu du CPU
 #define S_BLOCK_UNTIL_READY "block_until_ready"
 #define S_DEBUG "debug"
+#define S_UPD_GROUP "upd_group"
+#define S_UPD_STATUS "upd_status"  // texte d'état des mises à jour (réécrit à chaque ouverture)
+#define S_UPD_AUTO "upd_auto"      // reflet du réglage global (updater.json), pas un réglage de la source
+#define S_STATUS "status"             // texte d'état affiché (réécrit à chaque ouverture des réglages)
+
+// État du moteur d'analyse, affiché dans les réglages.
+enum EngineStatus {
+	STATUS_LOADING = 0,
+	STATUS_READY_CPU = 1,
+	STATUS_READY_GPU = 2,
+	STATUS_RUNTIME_ERROR = 3, // onnxruntime.dll introuvable ou incompatible
+	STATUS_MODEL_ERROR = 4,   // le modèle n'a pas pu être chargé
+	STATUS_INFER_ERROR = 5,   // l'inférence échoue
+};
+
+// Sans résultat d'analyse depuis ce délai (et au moins 3x le temps d'analyse mesuré),
+// l'analyse est considérée comme bloquée : la source est masquée si « Masquer tant que
+// le modèle n'est pas prêt » est coché (sécurité par défaut).
+constexpr uint64_t kStallNs = 3000000000ULL;
+// Une source qui n'a pas été rendue pendant ce délai (scène inactive, source masquée) :
+// les images en tampon sont périmées et ne doivent pas être réaffichées.
+constexpr uint64_t kRenderGapNs = 500000000ULL;
+// Le délai automatique ne diminue que s'il est resté trop grand pendant ce délai
+// (chaque changement fait sauter ou répéter une image, et décale l'audio).
+constexpr uint64_t kDelayDownNs = 10000000000ULL;
+// Intervalle minimal entre deux messages d'erreur identiques dans le journal.
+constexpr uint64_t kErrLogNs = 5000000000ULL;
 
 enum MaskMode { MASK_BLACK = 0, MASK_PIXELATE = 1, MASK_BLUR = 2 };
 
@@ -301,7 +331,7 @@ struct nsfw_filter {
 	bool new_tick = false;
 	uint64_t frame_id = 0; // incrémenté une fois par image réellement rendue
 	int64_t display_id = -1;
-	int cur_delay = 0;
+	std::atomic<int> cur_delay{0}; // lu aussi par l'interface (affichage)
 
 	// --- état de décision ---
 	int streak = 0;
@@ -346,6 +376,13 @@ struct nsfw_filter {
 	float res_infer_ms = 0.0f;
 
 	std::atomic<bool> ready{false};
+	std::atomic<int> status{STATUS_LOADING};
+
+	// --- sûreté (thread graphique) ---
+	uint64_t pending_since_ns = 0; // première analyse soumise restée sans résultat (0 : aucune)
+	uint64_t last_render_ns = 0;   // dernière image traitée, pour détecter une reprise après pause
+	uint64_t delay_down_ns = 0;    // depuis quand le délai automatique pourrait diminuer
+	bool stalled = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -365,6 +402,19 @@ static void worker_main(nsfw_filter *f)
 
 	std::vector<uint8_t> buf;
 	std::vector<Detection> dets, view_dets;
+	uint64_t last_err_log = 0;
+	bool ort_err_logged = false;
+
+	// Erreur d'inférence : journalisée au plus toutes les kErrLogNs pour ne pas noyer le
+	// journal d'OBS (jusqu'à 60 analyses par seconde).
+	auto log_infer_error = [&](const char *what) {
+		f->status = STATUS_INFER_ERROR;
+		const uint64_t t = os_gettime_ns();
+		if (t - last_err_log > kErrLogNs) {
+			blog(LOG_ERROR, LOG_PREFIX "erreur d'inférence : %s", what);
+			last_err_log = t;
+		}
+	};
 
 	for (;;) {
 		uint64_t frame = 0, submit_ns = 0;
@@ -393,6 +443,17 @@ static void worker_main(nsfw_filter *f)
 			f->has_job = false;
 		}
 
+		// ONNX Runtime absent ou incompatible : rien ne doit toucher à son API (plantage).
+		if (!OrtAvailable()) {
+			f->ready = false;
+			f->status = STATUS_RUNTIME_ERROR;
+			if (!ort_err_logged) {
+				blog(LOG_ERROR, LOG_PREFIX "ONNX Runtime indisponible : aucune analyse possible. Réinstallez le plugin.");
+				ort_err_logged = true;
+			}
+			continue;
+		}
+
 		views = std::clamp(views, 1, kMaxViews);
 		const size_t plane = static_cast<size_t>(side) * side * 4;
 		if (buf.size() < plane * static_cast<size_t>(views))
@@ -407,6 +468,7 @@ static void worker_main(nsfw_filter *f)
 			if ((!clf || want_dml != clf_dml) && !(clf_failed && clf_failed_dml == want_dml)) {
 				clf.reset();
 				f->ready = false;
+				f->status = STATUS_LOADING;
 				try {
 					clf = std::make_unique<Classifier>(f->model_path, want_dml);
 					clf_dml = want_dml;
@@ -430,8 +492,10 @@ static void worker_main(nsfw_filter *f)
 					}
 				}
 			}
-			if (!clf)
+			if (!clf) {
+				f->status = STATUS_MODEL_ERROR;
 				continue;
+			}
 			f->ready = true;
 
 			try {
@@ -442,13 +506,15 @@ static void worker_main(nsfw_filter *f)
 					infer_ms += ms;
 				}
 			} catch (const std::exception &e) {
-				blog(LOG_ERROR, LOG_PREFIX "erreur d'inférence : %s", e.what());
+				log_infer_error(e.what());
 				continue;
 			}
+			f->status = clf_dml ? STATUS_READY_GPU : STATUS_READY_CPU;
 		} else {
 			if (!det || det_engine != engine || det_dml != want_dml) {
 				det.reset();
 				f->ready = false;
+				f->status = STATUS_LOADING;
 				const char *name = engine == ENGINE_NUDENET_320N ? "NudeNet 320n" : "NudeNet 640m";
 				if (det_path.empty()) {
 					blog(LOG_ERROR,
@@ -497,9 +563,10 @@ static void worker_main(nsfw_filter *f)
 					}
 				}
 			} catch (const std::exception &e) {
-				blog(LOG_ERROR, LOG_PREFIX "erreur d'inférence : %s", e.what());
+				log_infer_error(e.what());
 				continue;
 			}
+			f->status = det_dml ? STATUS_READY_GPU : STATUS_READY_CPU;
 		}
 
 		const uint64_t now = os_gettime_ns();
@@ -751,6 +818,89 @@ static std::string models_status_text()
 	return t;
 }
 
+// Texte d'état affiché en tête des réglages : moteur, erreurs éventuelles, délai vidéo.
+static std::string filter_status_text(const nsfw_filter *f)
+{
+	static const char *const keys[] = {"Status.Loading",      "Status.ReadyCpu",   "Status.ReadyGpu",
+					   "Status.RuntimeError", "Status.ModelError", "Status.InferError"};
+	const int st = std::clamp(f->status.load(), 0, static_cast<int>(STATUS_INFER_ERROR));
+	std::string t = obs_module_text(keys[st]);
+	if (f->engine.load() != ENGINE_MOBILENET && f->det_failed.load())
+		t += "\n" + std::string(obs_module_text("Status.DetFallback"));
+
+	const int delay = f->cur_delay.load();
+	const int ms = static_cast<int>(std::lround(static_cast<float>(delay) * frame_ms()));
+	t += "\n" + std::string(obs_module_text("Status.Delay")) + " " + std::to_string(delay) + " " +
+	     obs_module_text("Status.Frames") + " (" + std::to_string(ms) + " ms)";
+	return t;
+}
+
+// Texte d'état du groupe « Mises à jour ».
+static std::string update_status_text()
+{
+	const UpdStatus u = updater_status();
+	std::string t = std::string(obs_module_text("Upd.Installed")) + " " + u.current;
+	switch (u.state) {
+	case UpdState::Idle:
+		break;
+	case UpdState::Checking:
+		t += "\n" + std::string(obs_module_text("Upd.Checking"));
+		break;
+	case UpdState::UpToDate:
+		t += "\n" + std::string(obs_module_text("Upd.UpToDate"));
+		break;
+	case UpdState::Available:
+		t += "\n" + std::string(obs_module_text("Upd.Available")) + " " + u.latest;
+		break;
+	case UpdState::Downloading:
+		t += "\n" + std::string(obs_module_text("Upd.Downloading")) + " " + u.latest + " : " +
+		     std::to_string(u.percent) + " %";
+		break;
+	case UpdState::Ready:
+		t += "\n" + std::string(obs_module_text("Upd.Ready")) + " " + u.latest + ". " +
+		     obs_module_text("Upd.ReadyNote");
+		break;
+	case UpdState::Error:
+		t += "\n" + std::string(obs_module_text("Upd.Error"));
+		break;
+	}
+	return t;
+}
+
+static bool upd_check_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	updater_check_now();
+	return true;
+}
+
+static bool upd_download_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	updater_download();
+	return true;
+}
+
+static bool upd_cancel_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	updater_cancel_pending();
+	return true;
+}
+
+static bool upd_page_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	const UpdStatus u = updater_status();
+	const std::string url = u.page_url.empty() ? "https://github.com/helldog136/obs-nsfw-guard/releases/latest"
+						   : u.page_url;
+	if (url.rfind("https://github.com/", 0) == 0) // jamais autre chose qu'une page GitHub
+		ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	return false;
+}
+
+static bool upd_auto_toggled(obs_properties_t *, obs_property_t *, obs_data_t *s)
+{
+	updater_set_auto_check(obs_data_get_bool(s, S_UPD_AUTO));
+	return false;
+}
+
 static bool start_download(void *priv, int index)
 {
 	auto *f = static_cast<nsfw_filter *>(priv);
@@ -874,8 +1024,15 @@ static obs_properties_t *filter_properties(void *data)
 	if (f && f->self) {
 		obs_data_t *st = obs_source_get_settings(f->self);
 		obs_data_set_string(st, S_MODELS_STATUS, models_status_text().c_str());
+		obs_data_set_string(st, S_STATUS, filter_status_text(f).c_str());
+		obs_data_set_string(st, S_UPD_STATUS, update_status_text().c_str());
+		obs_data_set_bool(st, S_UPD_AUTO, updater_auto_check());
 		obs_data_release(st);
 	}
+
+	obs_property_t *status = obs_properties_add_text(p, S_STATUS, obs_module_text("Status"), OBS_TEXT_INFO);
+	obs_property_set_long_description(status, obs_module_text("Status.Desc"));
+	obs_properties_add_button2(p, "status_refresh", obs_module_text("Status.Refresh"), refresh_clicked, f);
 
 	obs_property_t *prop = obs_properties_add_list(p, S_ENGINE, obs_module_text("Engine"), OBS_COMBO_TYPE_LIST,
 						       OBS_COMBO_FORMAT_INT);
@@ -977,8 +1134,31 @@ static obs_properties_t *filter_properties(void *data)
 	prop = obs_properties_add_bool(p, S_USE_DML, obs_module_text("UseDml"));
 	obs_property_set_long_description(prop, obs_module_text("UseDml.Desc"));
 	obs_property_set_modified_callback(prop, engine_toggled);
-	obs_properties_add_bool(p, S_BLOCK_UNTIL_READY, obs_module_text("BlockUntilReady"));
+	prop = obs_properties_add_bool(p, S_BLOCK_UNTIL_READY, obs_module_text("BlockUntilReady"));
+	obs_property_set_long_description(prop, obs_module_text("BlockUntilReady.Desc"));
 	obs_properties_add_bool(p, S_DEBUG, obs_module_text("Debug"));
+
+	// Mises à jour du plugin (réglage global, commun à tous les filtres).
+	{
+		const UpdStatus u = updater_status();
+		obs_properties_t *upd = obs_properties_create();
+		obs_properties_add_text(upd, S_UPD_STATUS, obs_module_text("Upd.StatusLabel"), OBS_TEXT_INFO);
+		obs_property_t *auto_prop = obs_properties_add_bool(upd, S_UPD_AUTO, obs_module_text("Upd.Auto"));
+		obs_property_set_long_description(auto_prop, obs_module_text("Upd.Auto.Desc"));
+		obs_property_set_modified_callback(auto_prop, upd_auto_toggled);
+		obs_properties_add_button2(upd, "upd_check", obs_module_text("Upd.Check"), upd_check_clicked, f);
+		obs_property_t *dl = obs_properties_add_button2(upd, "upd_download", obs_module_text("Upd.Download"),
+								upd_download_clicked, f);
+		obs_property_set_long_description(dl, obs_module_text("Upd.Download.Desc"));
+		obs_property_set_visible(dl, u.state == UpdState::Available ||
+						     (u.state == UpdState::Error && !u.latest.empty() &&
+						      u.latest != u.current));
+		obs_property_t *cancel = obs_properties_add_button2(upd, "upd_cancel", obs_module_text("Upd.Cancel"),
+								    upd_cancel_clicked, f);
+		obs_property_set_visible(cancel, u.state == UpdState::Ready);
+		obs_properties_add_button2(upd, "upd_page", obs_module_text("Upd.Page"), upd_page_clicked, f);
+		obs_properties_add_group(p, S_UPD_GROUP, obs_module_text("Upd"), OBS_GROUP_NORMAL, upd);
+	}
 
 	return p;
 }
@@ -1120,6 +1300,7 @@ static void consume_result(nsfw_filter *f)
 		else
 			dets = f->res_dets;
 	}
+	f->pending_since_ns = 0;
 
 	f->lat_ms_ema = 0.9f * f->lat_ms_ema + 0.1f * lat_ms;
 
@@ -1209,12 +1390,12 @@ static void consume_result(nsfw_filter *f)
 				blog(LOG_INFO,
 				     LOG_PREFIX "NudeNet : %zu détection(s), meilleur score retenu max=%.2f dernier=%.2f (vue %d/%d) | inférence=%.2f ms  latence=%.2f ms | délai=%d img | zones=%zu masque=%s%s",
 				     dets.size(), f->dbg_max_score, score, best_view, views, infer_ms, f->lat_ms_ema,
-				     f->cur_delay, f->regions.size(), f->mask_active ? "OUI" : "non",
+				     f->cur_delay.load(), f->regions.size(), f->mask_active ? "OUI" : "non",
 				     f->zone_sticky ? " | zone verrouillée" : "");
 			else
 				blog(LOG_INFO,
 				     LOG_PREFIX "score max=%.2f  dernier=%.2f (vue %d/%d) | inférence=%.2f ms  latence=%.2f ms | délai=%d img | masque=%s%s",
-				     f->dbg_max_score, score, best_view, views, infer_ms, f->lat_ms_ema, f->cur_delay,
+				     f->dbg_max_score, score, best_view, views, infer_ms, f->lat_ms_ema, f->cur_delay.load(),
 				     f->mask_active ? "OUI" : "non", f->zone_sticky ? " | zone verrouillée" : "");
 			if (det_engine) {
 				// Détail des détections (toutes classes) pour calibrer les réglages.
@@ -1245,9 +1426,37 @@ static void ensure_gfx(nsfw_filter *f, uint32_t w, uint32_t h, int delay)
 	size_t want = static_cast<size_t>(((delay + 2) + 7) / 8) * 8;
 	want = std::max<size_t>(want, 8);
 	if (want > f->ring.size()) {
-		while (f->ring.size() < want)
-			f->ring.push_back(gs_texrender_create(GS_RGBA, GS_ZS_NONE));
-		f->slot_id.assign(f->ring.size(), UINT64_MAX);
+		// Les images en tampon sont rangées à l'emplacement id % taille : on les déplace à
+		// leur nouvel emplacement au lieu de les jeter (sinon la source disparaîtrait le temps
+		// de remplir à nouveau le tampon). Les ids présents couvrent moins de `want` images
+		// consécutives, donc deux images ne peuvent pas viser le même emplacement.
+		std::vector<gs_texrender_t *> ring(want, nullptr);
+		std::vector<uint64_t> ids(want, UINT64_MAX);
+		std::vector<gs_texrender_t *> spare;
+		for (size_t i = 0; i < f->ring.size(); i++) {
+			const uint64_t id = f->slot_id[i];
+			const size_t j = id == UINT64_MAX ? 0 : static_cast<size_t>(id % want);
+			if (id != UINT64_MAX && f->ring[i] && !ring[j]) {
+				ring[j] = f->ring[i];
+				ids[j] = id;
+			} else if (f->ring[i]) {
+				spare.push_back(f->ring[i]);
+			}
+		}
+		for (auto &t : ring) {
+			if (t)
+				continue;
+			if (!spare.empty()) {
+				t = spare.back();
+				spare.pop_back();
+			} else {
+				t = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+			}
+		}
+		for (auto *t : spare)
+			gs_texrender_destroy(t);
+		f->ring.swap(ring);
+		f->slot_id.swap(ids);
 	}
 
 	if (!f->small_tr)
@@ -1545,6 +1754,8 @@ static void analyze(nsfw_filter *f, gs_texture_t *full)
 				f->has_job = true;
 			}
 			f->job_cv.notify_one();
+			if (!f->pending_since_ns)
+				f->pending_since_ns = os_gettime_ns();
 		}
 		f->stage_valid[prev] = false;
 	}
@@ -1759,9 +1970,33 @@ static void filter_render(void *data, gs_effect_t *)
 		f->new_tick = false;
 		f->frame_id++;
 
+		const uint64_t now = os_gettime_ns();
+		const bool resumed = f->last_render_ns == 0 || now - f->last_render_ns > kRenderGapNs;
+		if (resumed && f->last_render_ns != 0) {
+			// La source n'était plus rendue (scène inactive...) : les images en tampon sont
+			// périmées. On ne les réaffiche pas ; le tampon se remplit à nouveau.
+			std::fill(f->slot_id.begin(), f->slot_id.end(), UINT64_MAX);
+			f->stage_valid[0] = f->stage_valid[1] = false;
+			f->pending_since_ns = 0;
+		}
+		f->last_render_ns = now;
+
 		consume_result(f);
 
-		const uint64_t now = os_gettime_ns();
+		// Chien de garde : des analyses sont soumises mais aucun résultat ne revient.
+		const uint64_t stall_ns =
+			std::max(kStallNs, static_cast<uint64_t>(3.0f * f->lat_ms_ema * 1.0e6f));
+		const bool stalled = f->pending_since_ns != 0 && now - f->pending_since_ns > stall_ns;
+		if (stalled != f->stalled) {
+			f->stalled = stalled;
+			if (stalled)
+				blog(LOG_WARNING, LOG_PREFIX "aucun résultat d'analyse depuis %.1f s%s",
+				     static_cast<double>(now - f->pending_since_ns) / 1.0e9,
+				     f->block_until_ready.load() ? " : source masquée par sécurité" : "");
+			else
+				blog(LOG_INFO, LOG_PREFIX "l'analyse a repris");
+		}
+
 		if (f->mask_active &&
 		    now - f->last_pos_ns > static_cast<uint64_t>(f->hold_ms.load()) * 1000000ULL) {
 			f->mask_active = false;
@@ -1781,8 +2016,27 @@ static void filter_render(void *data, gs_effect_t *)
 			}
 		}
 
-		f->cur_delay = compute_delay(f);
-		ensure_gfx(f, w, h, f->cur_delay);
+		// Délai : en automatique, il augmente d'une image à la fois (une image répétée plutôt
+		// qu'un retour en arrière) et ne diminue qu'après kDelayDownNs de marge stable, pour
+		// limiter les saccades et garder un décalage audio constant.
+		const int want_delay = compute_delay(f);
+		if (resumed || !f->delay_on.load() || !f->auto_delay.load()) {
+			f->cur_delay = want_delay;
+			f->delay_down_ns = 0;
+		} else if (want_delay > f->cur_delay) {
+			f->cur_delay++;
+			f->delay_down_ns = 0;
+		} else if (want_delay < f->cur_delay) {
+			if (!f->delay_down_ns) {
+				f->delay_down_ns = now;
+			} else if (now - f->delay_down_ns > kDelayDownNs) {
+				f->cur_delay--;
+				f->delay_down_ns = now;
+			}
+		} else {
+			f->delay_down_ns = 0;
+		}
+		ensure_gfx(f, w, h, f->cur_delay.load());
 
 		const size_t n = f->ring.size();
 		const size_t slot = static_cast<size_t>(f->frame_id % n);
@@ -1792,7 +2046,7 @@ static void filter_render(void *data, gs_effect_t *)
 		if (f->frame_id % static_cast<uint64_t>(f->interval.load()) == 0)
 			analyze(f, gs_texrender_get_texture(f->ring[slot]));
 
-		f->display_id = static_cast<int64_t>(f->frame_id) - f->cur_delay;
+		f->display_id = static_cast<int64_t>(f->frame_id) - f->cur_delay.load();
 	}
 
 	if (f->ring.empty() || f->display_id < 0)
@@ -1808,7 +2062,7 @@ static void filter_render(void *data, gs_effect_t *)
 		return;
 
 	const bool masked = (f->mask_active && static_cast<uint64_t>(f->display_id) >= f->mask_start_id) ||
-			    (!f->ready.load() && f->block_until_ready.load());
+			    ((!f->ready.load() || f->stalled) && f->block_until_ready.load());
 
 	if (masked) {
 		draw_mask(f, tex);

@@ -9,16 +9,25 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <cmath>
 #include <vector>
 
 namespace {
-bool g_ort_ready = false;
+std::atomic<bool> g_ort_ready{false};
+std::mutex g_init_m;
 } // namespace
+
+bool OrtAvailable()
+{
+	return g_ort_ready.load();
+}
 
 bool ClassifierGlobalInit(const std::wstring &dir, std::string &err)
 {
+	std::lock_guard<std::mutex> lk(g_init_m);
 	if (g_ort_ready)
 		return true;
 

@@ -19,15 +19,35 @@ d'écran, capture de fenêtre, navigateur, etc.
 Sur un Ryzen 7 5800X, l'inférence prend environ 1,3 ms par image sur CPU (0,6 ms avec DirectML sur une
 Radeon RX 6900 XT). C'est une mesure sur une machine, pas une garantie.
 
-## Installation (Windows 64 bits, OBS 32.x)
+## Installation (Windows 64 bits, OBS 30 ou plus, testé avec OBS 32)
 
 1. Fermez OBS.
 2. Téléchargez `obs-nsfw-guard-*-windows-x64-setup.exe` depuis les [Releases](../../releases) et lancez-le.
+   Rien à compiler : l'installeur contient le plugin, ONNX Runtime, le modèle et, si votre machine ne l'a pas
+   déjà dans une version suffisante, le runtime Visual C++ de Microsoft (installé automatiquement).
 3. Relancez OBS, puis : clic droit sur une source → **Filtres** → **+** → **NSFW Guard**.
+4. Ouvrez les réglages du filtre : la ligne **État** doit indiquer « Analyse active ». Sinon, elle donne la cause.
 
-Désinstallation : « Applications installées » de Windows (ou `unins000.exe` dans le dossier du plugin).
-Les modèles NudeNet éventuellement téléchargés restent dans
-`%APPDATA%\obs-studio\plugin_config\obs-nsfw-guard\models` : supprimez ce dossier pour les retirer.
+L'installeur trouve OBS installé normalement ou via Steam. Il installe dans
+`C:\ProgramData\obs-studio\plugins\obs-nsfw-guard`, que lisent toutes les installations d'OBS **sauf la
+version portable** (non prise en charge). Installation silencieuse (déploiement) :
+`obs-nsfw-guard-*-setup.exe /VERYSILENT /SUPPRESSMSGBOXES`.
+
+### Mises à jour
+
+- **Automatiques (recommandé)** : le plugin regarde une fois par jour sur GitHub si une nouvelle version est
+  publiée (désactivable : réglages du filtre → **Mises à jour**). Si oui, la ligne d'état l'indique ; le bouton
+  « Télécharger la mise à jour » récupère l'installeur et vérifie son empreinte SHA-256. Il s'installe **à la
+  fermeture d'OBS** (Windows demande l'autorisation) : un stream n'est jamais interrompu.
+- **Manuelles** : lancez simplement l'installeur d'une version plus récente, par-dessus l'ancienne. Il indique
+  « Mise à jour de X vers Y », supprime les fichiers de l'ancienne version et conserve vos réglages et modèles.
+
+### Désinstallation
+
+« Paramètres Windows » → « Applications installées » → **NSFW Guard (plugin OBS)**, ou menu Démarrer →
+**NSFW Guard** → « Désinstaller NSFW Guard » (OBS doit être fermé). Le désinstalleur propose de supprimer aussi
+vos données (`%APPDATA%\obs-studio\plugin_config\obs-nsfw-guard` : modèles NudeNet téléchargés, préférences) ;
+les réglages des filtres, enregistrés dans vos scènes OBS, ne sont pas touchés.
 
 Installation manuelle : extrayez plutôt `obs-nsfw-guard-*-windows-x64.zip` dans
 `C:\ProgramData\obs-studio\plugins` (le dossier `obs-nsfw-guard` doit se retrouver dedans).
@@ -50,8 +70,24 @@ L'installeur n'est pas signé : Windows SmartScreen peut afficher un avertisseme
 | Taille de la zone aléatoire | Côté (en pixels de la source) de la zone analysée en mode « zone aléatoire » ou « mixte ». |
 | Analyser une image sur | Fréquence d'analyse (1 = chaque image). |
 | GPU (DirectML) | Utilise le GPU au lieu du CPU. Le CPU suffit et ne concurrence pas le jeu. À éviter en cas de doute : un blocage complet d'un PC a été observé une fois en testant le GPU avec un gros modèle, sans que la cause soit établie. |
-| Masquer tant que le modèle n'est pas prêt | La source reste masquée pendant le chargement du modèle. |
+| Masquer tant que l'analyse IA ne fonctionne pas | La source reste masquée pendant le chargement du modèle, s'il ne peut pas être chargé, ou si l'analyse ne répond plus (plus de 3 s sans résultat). |
+| Mises à jour | Version installée, recherche automatique (une fois par jour, désactivable), téléchargement d'une nouvelle version installée à la fermeture d'OBS. |
 | Journaliser scores et temps | Écrit score, temps d'inférence, latence et délai dans le journal d'OBS pour calibrer le seuil. |
+
+## Avant un live : recommandations
+
+- **Testez avant de diffuser** : ajoutez le filtre, vérifiez la ligne **État**, et faites un essai avec
+  « Journaliser scores et temps » pour calibrer le seuil sur votre contenu habituel (jeux, navigateur).
+- **Synchronisation audio** : le filtre retarde la vidéo de la source (quelques images, affiché dans **État**),
+  pas l'audio. Si l'audio de cette source (jeu, navigateur) doit rester synchrone, décochez « délai automatique »,
+  fixez un délai en images, et réglez le même décalage en ms dans « Propriétés audio avancées » →
+  « Décalage de synchronisation ». En automatique, le délai varie peu (il ne monte que d'une image à la fois
+  et ne redescend qu'après 10 s stables), mais il peut varier.
+- **Laissez « Masquer tant que l'analyse IA ne fonctionne pas » coché** : si le modèle ne se charge pas ou si
+  l'analyse cesse de répondre plus de 3 s, la source est masquée plutôt que diffusée sans protection.
+- Préférez le **CPU** et la méthode « Image entière réduite » ou « Zone aléatoire » ; gardez les grilles et le
+  GPU pour des machines testées.
+- C'est une aide, **pas une garantie** (voir « Limites ») : gardez un moyen manuel de couper la scène.
 
 ## Méthodes d'analyse
 
@@ -103,6 +139,7 @@ blocages sans ce plugin). Préférez le 320n sur CPU.
 
 ## Limites
 
+- L'installeur n'est pas signé numériquement : Windows SmartScreen peut avertir au premier lancement.
 - **Ce n'est pas une garantie.** Un classifieur fait des faux positifs et des faux négatifs. Ne comptez pas
   dessus comme seule protection pour respecter les règles d'une plateforme.
 - Avec la méthode « image entière réduite », l'image est écrasée en 224×224 sans recadrage (pour couvrir tout
@@ -110,7 +147,9 @@ blocages sans ce plugin). Préférez le 320n sur CPU.
   atténuent ce défaut, au prix de plus de ressources.
 - Le délai laisse passer au plus quelques images avant le masque si l'option « Retarder l'image » est
   désactivée.
-- Windows 64 bits uniquement pour l'instant. Développé et testé avec OBS 32.2.2.
+- Windows 64 bits uniquement pour l'instant. Développé et testé avec OBS 32.2.2. OBS portable non pris en charge.
+- Quand une source réapparaît (retour sur sa scène), elle reste vide le temps de remplir le tampon de délai
+  (quelques images) : les anciennes images ne sont jamais réaffichées.
 - Sources semi-transparentes : la composition alpha n'est pas gérée avec précision.
 - Mode « zone détectée » : le cadre suit le contenu au rythme des analyses ; un mouvement rapide peut le
   décaler d'une analyse (la marge sert à compenser). Seules les classes cochées déclenchent le masque.
@@ -157,8 +196,8 @@ when a small on-device ONNX classifier detects sensitive content. It has a built
 lands *before* the detected frame is shown, no separate Render Delay filter needed. Inference runs on a
 worker thread (about 1.3 ms/frame on a Ryzen 7 5800X CPU) and everything stays local.
 
-Windows x64 only, developed against OBS 32.2.2. Run the `-setup.exe` from the latest release (or unzip the
-zip into `C:\ProgramData\obs-studio\plugins`), restart OBS, and add **NSFW Guard** from a source's Filters dialog. It is not a guarantee: classifiers make
+Windows x64 only, OBS 30+ (developed against OBS 32.2.2; portable OBS not supported). Run the `-setup.exe` (no compilation needed; it also installs the Microsoft VC++ runtime if missing) from the latest release (or unzip the
+zip into `C:\ProgramData\obs-studio\plugins`), restart OBS, and add **NSFW Guard** from a source's Filters dialog. Updates: the plugin checks GitHub once a day (can be disabled), downloads the new installer on request (SHA-256 checked) and runs it when OBS closes; running a newer installer over an old one also updates in place. Uninstall from Windows "Installed apps" or the Start menu. It is not a guarantee: classifiers make
 mistakes. Licensed GPL-2.0-or-later.
 
 **Optional NudeNet detector** (masks only the detected area instead of the whole source): the NudeNet model

@@ -4,7 +4,9 @@
 
 #include <windows.h>
 
+#include "model-download.h"
 #include "nsfw-filter.h"
+#include "updater.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-nsfw-guard", "en-US")
@@ -35,11 +37,14 @@ bool obs_module_load(void)
 	}
 
 	register_nsfw_filter();
-	blog(LOG_INFO, "[nsfw-guard] plugin chargé");
+	blog(LOG_INFO, "[nsfw-guard] plugin chargé (version %s)", PLUGIN_VERSION);
+	updater_init();
 	return true;
 }
 
 void obs_module_unload(void)
 {
+	model_download_shutdown();
+	updater_shutdown(); // lance l'installeur d'une mise à jour téléchargée, s'il y en a une
 	blog(LOG_INFO, "[nsfw-guard] plugin déchargé");
 }

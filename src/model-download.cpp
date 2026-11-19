@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -25,6 +26,9 @@ const ModelInfo kModels[kModelCount] = {
 std::mutex g_status_m;
 DlStatus g_status;
 std::atomic<bool> g_busy{false};
+std::atomic<bool> g_cancel{false};
+std::mutex g_thread_m;
+std::thread g_thread;
 std::atomic<uint32_t> g_generation{0};
 
 void set_status(const DlStatus &s)
@@ -119,7 +123,7 @@ void download_thread(int index, std::wstring dest_dir)
 					  WINHTTP_NO_PROXY_BYPASS, 0));
 	if (!session.h)
 		return fail(DlError::Network);
-	WinHttpSetTimeouts(session.h, 15000, 15000, 30000, 60000);
+	WinHttpSetTimeouts(session.h, 15000, 15000, 30000, 30000);
 
 	WinHttpHandle connection(WinHttpConnect(session.h, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0));
 	if (!connection.h)
@@ -160,6 +164,11 @@ void download_thread(int index, std::wstring dest_dir)
 		}
 		if (got == 0)
 			break;
+		if (g_cancel) {
+			std::fclose(out);
+			_wremove(part.c_str());
+			return fail(DlError::Network);
+		}
 		hash.update(buf.data(), got);
 		if (std::fwrite(buf.data(), 1, got, out) != got)
 			io_ok = false;
@@ -212,8 +221,20 @@ bool start_model_download(int index, const std::wstring &dest_dir)
 	bool expected = false;
 	if (!g_busy.compare_exchange_strong(expected, true))
 		return false;
-	std::thread(download_thread, index, dest_dir).detach();
+	std::lock_guard<std::mutex> lk(g_thread_m);
+	if (g_thread.joinable())
+		g_thread.join(); // thread précédent déjà terminé (g_busy était faux)
+	g_cancel = false;
+	g_thread = std::thread(download_thread, index, dest_dir);
 	return true;
+}
+
+void model_download_shutdown()
+{
+	g_cancel = true;
+	std::lock_guard<std::mutex> lk(g_thread_m);
+	if (g_thread.joinable())
+		g_thread.join();
 }
 
 DlStatus download_status()
