@@ -31,6 +31,7 @@
 #include "detector.h"
 #include "model-download.h"
 #include "nsfw-filter.h"
+#include "updater.h"
 
 #define FILTER_ID "nsfw_guard_filter"
 #define LOG_PREFIX "[nsfw-guard] "
@@ -128,6 +129,9 @@ struct Region {
 #define S_USE_DML "use_dml"           // GPU (DirectML) au lieu du CPU
 #define S_BLOCK_UNTIL_READY "block_until_ready"
 #define S_DEBUG "debug"
+#define S_UPD_GROUP "upd_group"
+#define S_UPD_STATUS "upd_status"  // texte d'état des mises à jour (réécrit à chaque ouverture)
+#define S_UPD_AUTO "upd_auto"      // reflet du réglage global (updater.json), pas un réglage de la source
 #define S_STATUS "status"             // texte d'état affiché (réécrit à chaque ouverture des réglages)
 
 // État du moteur d'analyse, affiché dans les réglages.
@@ -831,6 +835,72 @@ static std::string filter_status_text(const nsfw_filter *f)
 	return t;
 }
 
+// Texte d'état du groupe « Mises à jour ».
+static std::string update_status_text()
+{
+	const UpdStatus u = updater_status();
+	std::string t = std::string(obs_module_text("Upd.Installed")) + " " + u.current;
+	switch (u.state) {
+	case UpdState::Idle:
+		break;
+	case UpdState::Checking:
+		t += "\n" + std::string(obs_module_text("Upd.Checking"));
+		break;
+	case UpdState::UpToDate:
+		t += "\n" + std::string(obs_module_text("Upd.UpToDate"));
+		break;
+	case UpdState::Available:
+		t += "\n" + std::string(obs_module_text("Upd.Available")) + " " + u.latest;
+		break;
+	case UpdState::Downloading:
+		t += "\n" + std::string(obs_module_text("Upd.Downloading")) + " " + u.latest + " : " +
+		     std::to_string(u.percent) + " %";
+		break;
+	case UpdState::Ready:
+		t += "\n" + std::string(obs_module_text("Upd.Ready")) + " " + u.latest + ". " +
+		     obs_module_text("Upd.ReadyNote");
+		break;
+	case UpdState::Error:
+		t += "\n" + std::string(obs_module_text("Upd.Error"));
+		break;
+	}
+	return t;
+}
+
+static bool upd_check_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	updater_check_now();
+	return true;
+}
+
+static bool upd_download_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	updater_download();
+	return true;
+}
+
+static bool upd_cancel_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	updater_cancel_pending();
+	return true;
+}
+
+static bool upd_page_clicked(obs_properties_t *, obs_property_t *, void *)
+{
+	const UpdStatus u = updater_status();
+	const std::string url = u.page_url.empty() ? "https://github.com/helldog136/obs-nsfw-guard/releases/latest"
+						   : u.page_url;
+	if (url.rfind("https://github.com/", 0) == 0) // jamais autre chose qu'une page GitHub
+		ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	return false;
+}
+
+static bool upd_auto_toggled(obs_properties_t *, obs_property_t *, obs_data_t *s)
+{
+	updater_set_auto_check(obs_data_get_bool(s, S_UPD_AUTO));
+	return false;
+}
+
 static bool start_download(void *priv, int index)
 {
 	auto *f = static_cast<nsfw_filter *>(priv);
@@ -955,6 +1025,8 @@ static obs_properties_t *filter_properties(void *data)
 		obs_data_t *st = obs_source_get_settings(f->self);
 		obs_data_set_string(st, S_MODELS_STATUS, models_status_text().c_str());
 		obs_data_set_string(st, S_STATUS, filter_status_text(f).c_str());
+		obs_data_set_string(st, S_UPD_STATUS, update_status_text().c_str());
+		obs_data_set_bool(st, S_UPD_AUTO, updater_auto_check());
 		obs_data_release(st);
 	}
 
@@ -1065,6 +1137,28 @@ static obs_properties_t *filter_properties(void *data)
 	prop = obs_properties_add_bool(p, S_BLOCK_UNTIL_READY, obs_module_text("BlockUntilReady"));
 	obs_property_set_long_description(prop, obs_module_text("BlockUntilReady.Desc"));
 	obs_properties_add_bool(p, S_DEBUG, obs_module_text("Debug"));
+
+	// Mises à jour du plugin (réglage global, commun à tous les filtres).
+	{
+		const UpdStatus u = updater_status();
+		obs_properties_t *upd = obs_properties_create();
+		obs_properties_add_text(upd, S_UPD_STATUS, obs_module_text("Upd.StatusLabel"), OBS_TEXT_INFO);
+		obs_property_t *auto_prop = obs_properties_add_bool(upd, S_UPD_AUTO, obs_module_text("Upd.Auto"));
+		obs_property_set_long_description(auto_prop, obs_module_text("Upd.Auto.Desc"));
+		obs_property_set_modified_callback(auto_prop, upd_auto_toggled);
+		obs_properties_add_button2(upd, "upd_check", obs_module_text("Upd.Check"), upd_check_clicked, f);
+		obs_property_t *dl = obs_properties_add_button2(upd, "upd_download", obs_module_text("Upd.Download"),
+								upd_download_clicked, f);
+		obs_property_set_long_description(dl, obs_module_text("Upd.Download.Desc"));
+		obs_property_set_visible(dl, u.state == UpdState::Available ||
+						     (u.state == UpdState::Error && !u.latest.empty() &&
+						      u.latest != u.current));
+		obs_property_t *cancel = obs_properties_add_button2(upd, "upd_cancel", obs_module_text("Upd.Cancel"),
+								    upd_cancel_clicked, f);
+		obs_property_set_visible(cancel, u.state == UpdState::Ready);
+		obs_properties_add_button2(upd, "upd_page", obs_module_text("Upd.Page"), upd_page_clicked, f);
+		obs_properties_add_group(p, S_UPD_GROUP, obs_module_text("Upd"), OBS_GROUP_NORMAL, upd);
+	}
 
 	return p;
 }

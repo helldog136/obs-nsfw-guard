@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(obs-nsfw-guard VERSION 0.3.1 LANGUAGES C CXX)
+project(obs-nsfw-guard VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +14,7 @@ add_library(obs-nsfw-guard MODULE
   src/classifier.cpp
   src/detector.cpp
   src/model-download.cpp
+  src/updater.cpp
 )
 
 target_include_directories(obs-nsfw-guard PRIVATE
@@ -30,7 +31,8 @@ target_link_libraries(obs-nsfw-guard PRIVATE ${DEPS}/obs.lib winhttp bcrypt shel
 # MSVC >= 14.40 plante si le msvcp140.dll chargé dans OBS est plus ancien (cas réel quand un
 # autre plugin ou une vieille application embarque sa propre copie du runtime).
 target_compile_definitions(obs-nsfw-guard PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
-  _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+  _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
+  PLUGIN_VERSION="${PROJECT_VERSION}")
 target_compile_options(obs-nsfw-guard PRIVATE /utf-8 /W3 /Zc:__cplusplus /Zc:preprocessor)
 
 # Empaquetage : stage/<layout d'un plugin OBS utilisateur>
