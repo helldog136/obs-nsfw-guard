@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Publier la release v<version du CMakeLists> (crée le tag sur ce commit)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -108,7 +113,7 @@ jobs:
   release:
     name: Publier la release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -124,7 +129,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
+          # Tag poussé : on l'utilise. Lancement manuel : v<version du CMakeLists>, créé sur ce commit.
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="v$(sed -nE 's/^project\(obs-nsfw-guard VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)"
+            if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "La release $tag existe déjà" >&2; exit 1
+            fi
+          fi
+          gh release create "$tag" dist/* \
             --repo "${{ github.repository }}" \
-            --title "NSFW Guard ${{ github.ref_name }}" \
+            --target "${{ github.sha }}" \
+            --title "NSFW Guard $tag" \
             --notes-file RELEASE_NOTES.md
